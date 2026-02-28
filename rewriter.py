@@ -5,7 +5,6 @@ import Milter
 import email.utils
 import os
 import checkdmarc
-import urllib.parse
 
 logging.basicConfig(level=logging.INFO)
 
@@ -48,9 +47,7 @@ class EnvelopeMilter(Milter.Base):
             if self.mail_from and self.header_from:
                 hdr_addr = email.utils.parseaddr(self.header_from)[1]
                 if check_dmarc(hdr_addr):
-                    new_hdr_addr = (
-                        urllib.parse.quote(hdr_addr) + "@" + forwarding_domain
-                    )
+                    new_hdr_addr = f"{hdr_addr.replace('@', '=40')}@{forwarding_domain}"
                     self.chgfrom(forwarding_addr)
                     self.chgheader(
                         "From",
