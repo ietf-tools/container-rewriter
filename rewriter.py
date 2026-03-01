@@ -55,7 +55,7 @@ def unwrap_address(email_addr, domain):
 def check_local(domain):
     try:
         local_domain_list = local_domains.split(" ")
-        return any(domain in x for x in local_domain_list)
+        return bool(len(set(local_domain_list).intersection(set(domain.split(" ")))))
     except AttributeError:
         return False
 
@@ -111,7 +111,7 @@ class EnvelopeMilter(Milter.Base):
                 logging.info(
                     f"[{self.id}] Header-From is {hdr_addr} Header-To is {self.header_to}"
                 )
-                if check_dmarc(self.mail_to):
+                if check_dmarc(self.hdr_addr):
                     new_hdr_addr = f"{hdr_addr.replace('@', '=40')}@{forwarding_domain}"
                     self.chgfrom(forwarding_addr)
                     self.chgheader(
