@@ -2,6 +2,8 @@ rewriter:
   forwardingAddr: forwardingalgorithm@myaddr.com
   forwardingDomain: myaddr.com
   listeningPort: 8800
+  localDomains:
+    - myaddr.com
 
 # This sets the type of deployment, either DaemonSet or Deployment
 deployKind: Deployment

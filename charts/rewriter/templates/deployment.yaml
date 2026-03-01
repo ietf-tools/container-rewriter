@@ -42,6 +42,8 @@ spec:
               value: {{ .Values.rewriter.forwardingAddr }}
             - name: FORWARDING_DOMAIN
               value: {{ .Values.rewriter.forwardingDomain }}
+            - name: LOCAL_DOMAINS
+              value: "{{ .Values.rewriter.localDomains | join " " }}"
           ports:
             - containerPort: {{ .Values.rewriter.listeningPort }}
               protocol: TCP
