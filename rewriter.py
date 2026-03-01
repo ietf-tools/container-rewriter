@@ -24,8 +24,10 @@ mailmatch = re.compile(
 def check_dmarc(email_addr):
     matches = ["reject", "quarantine"]
     domain = email_addr.split("@")[1]
-    if any(x in checkdmarc.check_dmarc(domain)["tags"]["p"]["value"] for x in matches):
-        return True
+    dmarc_status = checkdmarc.check_dmarc(domain)
+    if "tags" in dmarc_status:
+        if any(x in dmarc_status["tags"]["p"]["value"] for x in matches):
+            return True
     else:
         return False
 
