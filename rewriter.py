@@ -111,7 +111,7 @@ class EnvelopeMilter(Milter.Base):
                 logging.info(
                     f"[{self.id}] Header-From is {hdr_addr} Header-To is {self.header_to}"
                 )
-                if check_dmarc(self.mail_from):
+                if check_dmarc(self.hdr_addr):
                     new_hdr_addr = f"{hdr_addr.replace('@', '=40')}@{forwarding_domain}"
                     self.chgfrom(forwarding_addr)
                     self.chgheader(
