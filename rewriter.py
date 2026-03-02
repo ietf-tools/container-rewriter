@@ -8,16 +8,22 @@ import os
 import re
 import checkdmarc
 
-logging.basicConfig(level=logging.INFO)
-
-
 forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
 forwarding_domain = os.environ.get("FORWARDING_DOMAIN", "myaddr.com")
 local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
 listening_port = os.environ.get("LISTENING_PORT", "8800")
+log_level = os.environ.get("LOG_LEVEL", "DEBUG")
+
 mailmatch = re.compile(
     r"[-A-Za-z0-9!#$%&'*+/=?^_`{|}~]+(?:\.[-A-Za-z0-9!#$%&'*+/=?^_`{|}~]+)*=40(?:[A-Za-z0-9](?:[-A-Za-z0-9]*[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[-A-Za-z0-9]*[A-Za-z0-9])?",
     re.IGNORECASE,
+)
+
+logging.basicConfig(
+    level=log_level,
+    style="{",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    format="{asctime} {levelname} {filename}:{lineno}: {message}",
 )
 
 
@@ -91,43 +97,53 @@ class EnvelopeMilter(Milter.Base):
                 f"[{self.id}] Envelope-To: {self.mail_to or 'N/A'}, Header-To: {self.header_to or 'N/A'}"
             )
 
-            hdr_addr = email.utils.parseaddr(self.header_from)[1]
-            if unwrapped_addr := check_wrapped(self.mail_to, forwarding_domain):
+            hdr_from_addr = email.utils.parseaddr(self.header_from)[1]
+            env_from_addr = email.utils.parseaddr(self.mail_from)[1]
+            hdr_to_addr = email.utils.parseaddr(self.header_to)[1]
+            env_to_addr = email.utils.parseaddr(self.mail_to)[1]
+            if unwrapped_addr := check_wrapped(env_to_addr, forwarding_domain):
                 logging.info(
-                    f"[{self.id}] Header from: {hdr_addr} is remote, Header To: {self.header_to} is wrapped local"
+                    f"[{self.id}] Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local"
                 )
                 logging.info(
-                    f"[{self.id}] Unwrapped from {self.mail_to} to {unwrapped_addr}"
+                    f"[{self.id}] Unwrapped from {env_to_addr} to {unwrapped_addr}"
                 )
-                self.delrcpt(self.mail_to)
+                self.delrcpt(env_to_addr)
                 self.addrcpt(f"<{unwrapped_addr}>")
                 return Milter.ACCEPT
-            elif check_local(self.mail_to.split("@")[-1].replace(">", "")):
+            elif check_local(env_to_addr.split("@")[-1].replace(">", "")):
                 logging.info(
-                    f"[{self.id}] Local delivery, no action needed Envelope-From: {self.mail_from} Evelope-To: {self.mail_to}"
+                    f"[{self.id}] Local recipient, no action needed Envelope-From: {env_from_addr} Envelope-To: {env_to_addr}"
+                )
+                return Milter.ACCEPT
+            elif check_local(hdr_from_addr.split("@")[-1].replace(">", "")):
+                logging.info(
+                    f"[{self.id}] Local source, no action needed Envelope-From: {env_from_addr} Envelope-To: {env_to_addr}"
                 )
                 return Milter.ACCEPT
             else:
                 logging.info(
-                    f"[{self.id}] Header-From is {hdr_addr} Header-To is {self.header_to}"
+                    f"[{self.id}] Header-From is {hdr_from_addr} Header-To is {hdr_to_addr}"
                 )
-                if check_dmarc(hdr_addr):
-                    new_hdr_addr = f"{hdr_addr.replace('@', '=40')}@{forwarding_domain}"
+                if check_dmarc(hdr_from_addr):
+                    new_hdr_from_addr = (
+                        f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
+                    )
                     self.chgfrom(forwarding_addr)
                     self.chgheader(
                         "From",
                         0,
-                        new_hdr_addr,
+                        new_hdr_from_addr,
                     )
                     logging.info(
-                        f"[{self.id}] Envelope-From changed from {self.mail_from} to {forwarding_addr}"
+                        f"[{self.id}] Envelope-From changed from {env_from_addr} to {forwarding_addr}"
                     )
                     logging.info(
-                        f"[{self.id}] Header-From changed from {hdr_addr} to {new_hdr_addr}"
+                        f"[{self.id}] Header-From changed from {hdr_from_addr} to {new_hdr_from_addr}"
                     )
                 else:
                     logging.info(
-                        f"[{self.id}] No change for Envelope-From {self.mail_from} or Header-From {hdr_addr}"
+                        f"[{self.id}] No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr}"
                     )
 
                 return Milter.ACCEPT
