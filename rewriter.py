@@ -112,29 +112,6 @@ class EnvelopeMilter(Milter.Base):
                 self.addrcpt(f"<{unwrapped_addr}>")
                 return Milter.ACCEPT
             elif check_local(env_to_addr.split("@")[-1].replace(">", "")):
-                if email.utils.parseaddr(env_to_addr)[1] == hdr_to_addr:
-                    if check_dmarc(hdr_from_addr):
-                        new_hdr_from_addr = (
-                            f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
-                        )
-                        self.chgfrom(forwarding_addr)
-                        self.chgheader(
-                            "From",
-                            0,
-                            new_hdr_from_addr,
-                        )
-                        logging.info(
-                            f"[{self.id}] Envelope-From changed from {env_from_addr} to {forwarding_addr}"
-                        )
-                        logging.info(
-                            f"[{self.id}] Header-From changed from {hdr_from_addr} to {new_hdr_from_addr}"
-                        )
-                    else:
-                        logging.info(
-                            f"[{self.id}] No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr}"
-                        )
-
-                    return Milter.ACCEPT
                 logging.info(
                     f"[{self.id}] Local recipient, no action needed Envelope-From: {env_from_addr} Envelope-To: {env_to_addr}"
                 )
