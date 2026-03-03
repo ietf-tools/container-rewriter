@@ -58,9 +58,10 @@ def unwrap_address(email_addr, domain):
     return unwrapped_addr
 
 
-def check_local(domain):
+def check_local(email_addr):
     try:
         local_domain_list = local_domains.split(" ")
+        domain = email_addr.split("@")[-1]
         return bool(len(set(local_domain_list).intersection(set(domain.split(" ")))))
     except AttributeError:
         return False
@@ -101,6 +102,7 @@ class EnvelopeMilter(Milter.Base):
             env_from_addr = email.utils.parseaddr(self.mail_from)[1]
             hdr_to_addr = email.utils.parseaddr(self.header_to)[1]
             env_to_addr = email.utils.parseaddr(self.mail_to)[1]
+            # scenario 1
             if unwrapped_addr := check_wrapped(env_to_addr, forwarding_domain):
                 logging.info(
                     f"[{self.id}] Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local"
@@ -111,20 +113,73 @@ class EnvelopeMilter(Milter.Base):
                 self.delrcpt(env_to_addr)
                 self.addrcpt(f"<{unwrapped_addr}>")
                 return Milter.ACCEPT
-            elif check_local(env_to_addr.split("@")[-1].replace(">", "")):
+            # scenario 2
+            elif check_local(env_to_addr) and env_to_addr == hdr_to_addr:
                 logging.info(
-                    f"[{self.id}] Local recipient, no action needed Envelope-From: {env_from_addr} Envelope-To: {env_to_addr}"
+                    f"[{self.id}] Local list recipient, no action needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
                 )
                 return Milter.ACCEPT
-            elif check_local(hdr_from_addr.split("@")[-1].replace(">", "")):
+            # scenario 3
+            elif check_local(env_from_addr) and check_local(hdr_from_addr):
                 logging.info(
-                    f"[{self.id}] Local source, no action needed Envelope-From: {env_from_addr} Envelope-To: {env_to_addr}"
+                    f"[{self.id}] List source, no action needed Envelope-From: {env_from_addr} Header-From: {hdr_from_addr}"
                 )
                 return Milter.ACCEPT
+            # scenario 4
+            elif hdr_from_addr == env_to_addr:
+                logging.info(
+                    f"[{self.id}] List fanout, Header-From: {hdr_from_addr} Envelope-To: {env_to_addr}"
+                )
+                if check_dmarc(hdr_from_addr):
+                    new_hdr_from_addr = (
+                        f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
+                    )
+                    self.chgfrom(forwarding_addr)
+                    self.chgheader(
+                        "From",
+                        0,
+                        new_hdr_from_addr,
+                    )
+                    logging.info(
+                        f"[{self.id}] Envelope-From changed from {env_from_addr} to {forwarding_addr}"
+                    )
+                    logging.info(
+                        f"[{self.id}] Header-From changed from {hdr_from_addr} to {new_hdr_from_addr}"
+                    )
+                else:
+                    logging.info(
+                        f"[{self.id}] No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr}"
+                    )
+                return Milter.ACCEPT
+            # scenario 5
+            elif check_local(env_to_addr) and env_to_addr != hdr_to_addr:
+                logging.info(
+                    f"[{self.id}] Alias delivery Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
+                )
+                if check_dmarc(hdr_from_addr):
+                    new_hdr_from_addr = (
+                        f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
+                    )
+                    self.chgfrom(forwarding_addr)
+                    self.chgheader(
+                        "From",
+                        0,
+                        new_hdr_from_addr,
+                    )
+                    logging.info(
+                        f"[{self.id}] Envelope-From changed from {env_from_addr} to {forwarding_addr}"
+                    )
+                    logging.info(
+                        f"[{self.id}] Header-From changed from {hdr_from_addr} to {new_hdr_from_addr}"
+                    )
+                else:
+                    logging.info(
+                        f"[{self.id}] No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr}"
+                    )
+                return Milter.ACCEPT
+            # no scenario match
             else:
-                logging.info(
-                    f"[{self.id}] Header-From is {hdr_from_addr} Header-To is {hdr_to_addr}"
-                )
+                logging.info(f"[{self.id}] Fall through")
                 if check_dmarc(hdr_from_addr):
                     new_hdr_from_addr = (
                         f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
