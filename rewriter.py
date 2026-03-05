@@ -146,6 +146,7 @@ class EnvelopeMilter(Milter.Base):
                         f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
                     )
                     self.chgfrom(forwarding_addr)
+                    self.addheader("X-Original-From", self.header_from)
                     self.chgheader(
                         "From",
                         0,
@@ -177,6 +178,7 @@ class EnvelopeMilter(Milter.Base):
                         f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
                     )
                     self.chgfrom(forwarding_addr)
+                    self.addheader("X-Original-From", self.header_from)
                     self.chgheader(
                         "From",
                         0,
@@ -206,6 +208,7 @@ class EnvelopeMilter(Milter.Base):
                         f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
                     )
                     self.chgfrom(forwarding_addr)
+                    self.addheader("X-Original-From", self.header_from)
                     self.chgheader(
                         "From",
                         0,
