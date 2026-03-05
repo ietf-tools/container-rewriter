@@ -109,7 +109,7 @@ class EnvelopeMilter(Milter.Base):
                 f"[{self.id}] Envelope-To: {self.mail_to or 'N/A'}, Header-To: {self.header_to or 'N/A'}"
             )
 
-            hdr_from_addr = email.utils.parseaddr(self.header_from)[1]
+            hdr_from_name, hdr_from_addr = email.utils.parseaddr(self.header_from)
             env_from_addr = email.utils.parseaddr(self.mail_from)[1]
             hdr_to_addr = email.utils.parseaddr(self.header_to)[1]
             env_to_addr = email.utils.parseaddr(self.mail_to)[1]
@@ -142,8 +142,8 @@ class EnvelopeMilter(Milter.Base):
                     f"[{self.id}] List fanout, Header-From: {hdr_from_addr} Envelope-To: {env_to_addr}"
                 )
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = (
-                        f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
+                    new_hdr_from_addr = email.utils.formataddr(
+                        (hdr_from_name, f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}")
                     )
                     self.chgfrom(forwarding_addr)
                     self.addheader("X-Original-From", self.header_from)
@@ -174,8 +174,8 @@ class EnvelopeMilter(Milter.Base):
                     f"[{self.id}] Alias delivery Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
                 )
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = (
-                        f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
+                    new_hdr_from_addr = email.utils.formataddr(
+                        (hdr_from_name, f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}")
                     )
                     self.chgfrom(forwarding_addr)
                     self.addheader("X-Original-From", self.header_from)
@@ -204,8 +204,8 @@ class EnvelopeMilter(Milter.Base):
             else:
                 logging.info(f"[{self.id}] Fall through")
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = (
-                        f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
+                    new_hdr_from_addr = email.utils.formataddr(
+                        (hdr_from_name, f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}")
                     )
                     self.chgfrom(forwarding_addr)
                     self.addheader("X-Original-From", self.header_from)
