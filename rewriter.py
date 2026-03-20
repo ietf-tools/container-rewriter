@@ -139,14 +139,20 @@ class EnvelopeMilter(Milter.Base):
             # scenario 4
             elif check_local(env_to_addr) and env_to_addr != hdr_to_addr:
                 logging.info(
-                    f"[{self.id}] Alias delivery Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
+                    f"[{self.id}] Multiple addresses, Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
                 )
                 for addr in self.header_to.split(','):
                     if check_local(addr):
-                        logging.info(
-                            f"[{self.id}] One address of many is local, dont rewrite from; Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
-                        )
-                        return Milter.ACCEPT
+                        if addr == env_to_addr:
+                          logging.info(
+                              f"[{self.id}] This address is local, dont rewrite from; Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
+                          )
+                          return Milter.ACCEPT
+                        else:
+                          logging.info(
+                              f"[{self.id}] This address is a remote alias delivery Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
+                          )
+
                 if check_dmarc(hdr_from_addr):
                     new_hdr_from_addr = (
                         f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
