@@ -44,6 +44,26 @@ spec:
               value: {{ .Values.rewriter.forwardingDomain }}
             - name: LOCAL_DOMAINS
               value: "{{ .Values.rewriter.localDomains | join " " }}"
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ tpl .Values.rewriter.database.host.existingSecretName . }}
+                  key: {{ tpl .Values.rewriter.database.host.existingSecretKey . }}
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ tpl .Values.rewriter.database.db_name.existingSecretName . }}
+                  key: {{ tpl .Values.rewriter.database.db_name.existingSecretKey . }}
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ tpl .Values.rewriter.database.user.existingSecretName . }}
+                  key: {{ tpl .Values.rewriter.database.user.existingSecretKey . }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ tpl .Values.rewriter.database.password.existingSecretName . }}
+                  key: {{ tpl .Values.rewriter.database.password.existingSecretKey . }}
           ports:
             - containerPort: {{ .Values.rewriter.listeningPort }}
               protocol: TCP

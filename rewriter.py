@@ -6,13 +6,19 @@ import Milter
 import email.utils
 import os
 import re
+import sys
 import checkdmarc
+
+from psycopg_pool import ConnectionPool
+import psycopg
+
 
 forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
 forwarding_domain = os.environ.get("FORWARDING_DOMAIN", "myaddr.com")
 local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
 listening_port = os.environ.get("LISTENING_PORT", "8800")
 log_level = os.environ.get("LOG_LEVEL", "DEBUG")
+pool_cache: dict[ConnectionPool] = {}
 
 mailmatch = re.compile(
     r"[-A-Za-z0-9!#$%&'*+/=?^_`{|}~]+(?:\.[-A-Za-z0-9!#$%&'*+/=?^_`{|}~]+)*=40(?:[A-Za-z0-9](?:[-A-Za-z0-9]*[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[-A-Za-z0-9]*[A-Za-z0-9])?",
@@ -26,6 +32,34 @@ logging.basicConfig(
     format="{asctime} {levelname} {filename}:{lineno}: {message}",
 )
 
+
+def get_db_pool() -> ConnectionPool:
+  try:
+    pool = ConnectionPool(kwargs={
+      "dbname": os.getenv("DB_NAME", "postfix"),
+      "host": os.getenv("DB_HOST", "localhost"),
+      "user": os.getenv("DB_USER", "postgres"),
+      "password": os.getenv("DB_PASSWORD", "postgres"),
+      "port": os.getenv("DB_PORT", "5432")
+    })
+  except psycopg.OperationalError as e:
+    logging.info(f"DB Error: {e}")
+    raise e
+    sys.exit(1)
+  pool.open(wait=True)
+  return pool
+
+
+def test_virtual_alias(email_addr):
+    with get_db_pool() as pool:
+      with pool.connection() as connection:
+        with connection.cursor() as cur:
+          cur.execute("SELECT email from virtual where email = %s", (email_addr,))
+          result = cur.fetchall()
+    if len(result) == 1:
+      return True
+    else:
+      return False
 
 def check_dmarc(email_addr):
     matches = ["reject", "quarantine"]
@@ -111,7 +145,7 @@ class EnvelopeMilter(Milter.Base):
 
             hdr_from_name, hdr_from_addr = email.utils.parseaddr(self.header_from)
             env_from_addr = email.utils.parseaddr(self.mail_from)[1]
-            hdr_to_addr = email.utils.parseaddr(self.header_to)[1]
+            hdr_to_addr = email.utils.parseaddr(self.header_to)
             env_to_addr = email.utils.parseaddr(self.mail_to)[1]
             # scenario 1
             if unwrapped_addr := check_wrapped(env_to_addr, forwarding_domain):
@@ -125,34 +159,15 @@ class EnvelopeMilter(Milter.Base):
                 self.addrcpt(f"<{unwrapped_addr}>")
                 return Milter.ACCEPT
             # scenario 2
-            elif check_local(env_to_addr) and env_to_addr == hdr_to_addr:
+            elif check_local(env_to_addr) and not test_virtual_alias(env_to_addr):
                 logging.info(
                     f"[{self.id}] Local list recipient, no action needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
                 )
                 return Milter.ACCEPT
-            # scenario 3
-            elif check_local(env_from_addr) and check_local(hdr_from_addr):
+            elif check_local(env_to_addr) and test_virtual_alias(env_to_addr):
                 logging.info(
-                    f"[{self.id}] List source, no action needed Envelope-From: {env_from_addr} Header-From: {hdr_from_addr}"
+                    f"[{self.id}] Virtual address recipient, check if rewrite needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
                 )
-                return Milter.ACCEPT
-            # scenario 4
-            elif check_local(env_to_addr) and env_to_addr != hdr_to_addr:
-                logging.info(
-                    f"[{self.id}] Multiple addresses, Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
-                )
-                for addr in self.header_to.split(','):
-                    if check_local(addr):
-                        if addr == env_to_addr:
-                          logging.info(
-                              f"[{self.id}] This address is local, dont rewrite from; Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
-                          )
-                          return Milter.ACCEPT
-                        else:
-                          logging.info(
-                              f"[{self.id}] This address is a remote alias delivery Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
-                          )
-
                 if check_dmarc(hdr_from_addr):
                     new_hdr_from_addr = (
                         f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
@@ -178,6 +193,12 @@ class EnvelopeMilter(Milter.Base):
                     logging.info(
                         f"[{self.id}] No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr}"
                     )
+                return Milter.ACCEPT
+            # scenario 3
+            elif check_local(env_from_addr) and check_local(hdr_from_addr):
+                logging.info(
+                    f"[{self.id}] List source, no action needed Envelope-From: {env_from_addr} Header-From: {hdr_from_addr}"
+                )
                 return Milter.ACCEPT
             # no scenario match
             else:
