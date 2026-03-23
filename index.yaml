@@ -2,6 +2,19 @@ apiVersion: v1
 entries:
   rewriter:
   - apiVersion: v2
+    appVersion: 1.0.19
+    created: "2026-03-23T02:17:07.137334724Z"
+    description: IETF rewriting milter deployment for kubernetes
+    digest: 7c78692b4dbc16ccc914f9fd1e055bc363d113755c1e61fe00fd6014df7dfcc6
+    maintainers:
+    - name: Dane Foster
+    - name: Sam Sargeant
+    name: rewriter
+    type: application
+    urls:
+    - https://github.com/ietf-tools/container-rewriter/releases/download/rewriter-1.0.19/rewriter-1.0.19.tgz
+    version: 1.0.19
+  - apiVersion: v2
     appVersion: 1.0.18
     created: "2026-03-23T01:48:17.543505345Z"
     description: IETF rewriting milter deployment for kubernetes
@@ -221,4 +234,4 @@ entries:
     urls:
     - https://github.com/ietf-tools/container-rewriter/releases/download/rewriter-1.0.0/rewriter-1.0.0.tgz
     version: 1.0.0
-generated: "2026-03-23T01:48:17.543671907Z"
+generated: "2026-03-23T02:17:07.137482562Z"
