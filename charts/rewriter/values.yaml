@@ -1,10 +1,32 @@
+secret_db:
+  create: false
+  name: db-app
+  data:
+    dbname: postfix
+    host: dbserver
+    port: 5432
+    username: rewriter
+    password: rewriter
+
 rewriter:
   forwardingAddr: forwardingalgorithm@myaddr.com
   forwardingDomain: myaddr.com
   listeningPort: 8800
   localDomains:
     - myaddr.com
-
+  database:
+    host:
+      existingSecretName: db-app
+      existingSecretKey: host
+    user:
+      existingSecretName: db-app
+      existingSecretKey: username
+    db_name:
+      existingSecretName: db-app
+      existingSecretKey: dbname
+    password:
+      existingSecretName: db-app
+      existingSecretKey: password
 # This sets the type of deployment, either DaemonSet or Deployment
 deployKind: Deployment
 # If deployKind: Deployment

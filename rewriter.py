@@ -8,6 +8,11 @@ import os
 import re
 import checkdmarc
 
+from psycopg_pool import ConnectionPool
+import psycopg
+
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
 forwarding_domain = os.environ.get("FORWARDING_DOMAIN", "myaddr.com")
 local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
@@ -26,6 +31,63 @@ logging.basicConfig(
     format="{asctime} {levelname} {filename}:{lineno}: {message}",
 )
 
+
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+  # Override the do_GET method to handle GET requests
+  def do_GET(self):
+    if self.path == '/healthz':
+      try:
+        with get_db_pool() as pool:
+          with pool.connection() as conn:
+            with connection.cursor() as cur:
+              cur.execute("SELECT email from virtual LIMIT 1")
+              result = cur.fetchall()
+              self.send_response(200)
+              self.send_header('Content-type', 'text/html')
+              self.end_headers()
+              self.wfile.write(b"OK")
+      except psycopg.OperationalError:
+        self.send_response(400)
+        # Set the response headers
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        # Write the response content
+        self.wfile.write(b"Not OK")
+    else:
+      self.send_response(200)
+      # Set the response headers
+      self.send_header('Content-type', 'text/html')
+      self.end_headers()
+      # Write the response content
+      self.wfile.write(b"Not OK")
+
+
+def get_db_pool() -> ConnectionPool:
+  try:
+    pool = ConnectionPool(kwargs={
+      "dbname": os.getenv("DB_NAME", "postfix"),
+      "host": os.getenv("DB_HOST", "localhost"),
+      "user": os.getenv("DB_USER", "postgres"),
+      "password": os.getenv("DB_PASSWORD", "postgres"),
+      "port": os.getenv("DB_PORT", "5432")
+    }, check=ConnectionPool.check_connection)
+  except psycopg.OperationalError as e:
+    logging.info(f"DB Error: {e}")
+    raise e
+  pool.open(wait=True)
+  return pool
+
+
+def test_virtual_alias(email_addr):
+    with get_db_pool() as pool:
+      with pool.connection() as connection:
+        with connection.cursor() as cur:
+          cur.execute("SELECT email from virtual where email = %s", (email_addr,))
+          result = cur.fetchall()
+    if len(result) == 1:
+      return True
+    else:
+      return False
 
 def check_dmarc(email_addr):
     matches = ["reject", "quarantine"]
@@ -111,7 +173,7 @@ class EnvelopeMilter(Milter.Base):
 
             hdr_from_name, hdr_from_addr = email.utils.parseaddr(self.header_from)
             env_from_addr = email.utils.parseaddr(self.mail_from)[1]
-            hdr_to_addr = email.utils.parseaddr(self.header_to)[1]
+            hdr_to_addr = email.utils.parseaddr(self.header_to)
             env_to_addr = email.utils.parseaddr(self.mail_to)[1]
             # scenario 1
             if unwrapped_addr := check_wrapped(env_to_addr, forwarding_domain):
@@ -125,34 +187,15 @@ class EnvelopeMilter(Milter.Base):
                 self.addrcpt(f"<{unwrapped_addr}>")
                 return Milter.ACCEPT
             # scenario 2
-            elif check_local(env_to_addr) and env_to_addr == hdr_to_addr:
+            elif check_local(env_to_addr) and not test_virtual_alias(env_to_addr):
                 logging.info(
                     f"[{self.id}] Local list recipient, no action needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
                 )
                 return Milter.ACCEPT
-            # scenario 3
-            elif check_local(env_from_addr) and check_local(hdr_from_addr):
+            elif check_local(env_to_addr) and test_virtual_alias(env_to_addr):
                 logging.info(
-                    f"[{self.id}] List source, no action needed Envelope-From: {env_from_addr} Header-From: {hdr_from_addr}"
+                    f"[{self.id}] Virtual address recipient, check if rewrite needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
                 )
-                return Milter.ACCEPT
-            # scenario 4
-            elif check_local(env_to_addr) and env_to_addr != hdr_to_addr:
-                logging.info(
-                    f"[{self.id}] Multiple addresses, Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
-                )
-                for addr in self.header_to.split(','):
-                    if check_local(addr):
-                        if addr == env_to_addr:
-                          logging.info(
-                              f"[{self.id}] This address is local, dont rewrite from; Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
-                          )
-                          return Milter.ACCEPT
-                        else:
-                          logging.info(
-                              f"[{self.id}] This address is a remote alias delivery Envelope-To: {env_to_addr} Header-To: {hdr_to_addr}"
-                          )
-
                 if check_dmarc(hdr_from_addr):
                     new_hdr_from_addr = (
                         f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
@@ -178,6 +221,12 @@ class EnvelopeMilter(Milter.Base):
                     logging.info(
                         f"[{self.id}] No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr}"
                     )
+                return Milter.ACCEPT
+            # scenario 3
+            elif check_local(env_from_addr) and check_local(hdr_from_addr):
+                logging.info(
+                    f"[{self.id}] List source, no action needed Envelope-From: {env_from_addr} Header-From: {hdr_from_addr}"
+                )
                 return Milter.ACCEPT
             # no scenario match
             else:
@@ -223,7 +272,14 @@ def main():
     def run():
         Milter.runmilter("EnvelopeMilter", "inet:" + listening_port, timeout)
 
+    def run_http():
+        server_address = ('', 8000)
+        # Create an instance of the threaded HTTP server
+        httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
+        httpd.serve_forever()
+
     t = threading.Thread(target=run)
+    t = threading.Thread(target=run_http)
     t.start()
     t.join()
 

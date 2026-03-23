@@ -9,6 +9,7 @@ idna==3.11
 importlib-resources==6.5.2
 pem==23.1.0
 publicsuffixlist==1.0.2.20260226
+psycopg[pool]==3.3.3
 pycparser==3.0
 pyleri==1.5.0
 pymilter==1.0.5
