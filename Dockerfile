@@ -4,9 +4,8 @@ ENV FORWARDING_ADDR=forwardingalgorithm@myaddr.com
 ENV FORWARDING_DOMAIN=myaddr.com
 ENV LISTENING_PORT=8800
 
-ADD . /app
-
 WORKDIR /app
+COPY requirements.txt /app
 
 RUN apt-get update && \
     apt-get install -fy --no-install-recommends libmilter-dev && \
@@ -17,8 +16,13 @@ RUN apt-get update && \
     pip install -r requirements.txt && \
     adduser rewriter
 
-USER rewriter
+
+ADD . /app
+
+#USER rewriter
 
 EXPOSE 8800
+
+EXPOSE 8000
 
 CMD ["python", "/app/rewriter.py"]
