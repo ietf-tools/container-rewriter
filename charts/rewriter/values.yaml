@@ -83,14 +83,16 @@ resources: {}
   #   memory: 128Mi
 
 livenessProbe:
-  tcpSocket:
-    port: 8800
+  httpGet:
+    path: /healthz
+    port: 8000
   initialDelaySeconds: 5
   periodSeconds: 10
 
 readinessProbe:
-  tcpSocket:
-    port: 8800
+  httpGet:
+    path: /healthz
+    port: 8000
   initialDelaySeconds: 2
   periodSeconds: 5
 

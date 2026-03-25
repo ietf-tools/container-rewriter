@@ -67,6 +67,8 @@ spec:
           ports:
             - containerPort: {{ .Values.rewriter.listeningPort }}
               protocol: TCP
+            - containerPort: 8000
+              protocol: TCP
           {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
