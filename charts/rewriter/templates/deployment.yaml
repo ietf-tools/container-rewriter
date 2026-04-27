@@ -122,6 +122,7 @@ spec:
             defaultMode: 0444
         {{- end }}
         {{- end }}
+      {{- end }}
       {{- with .Values.dnsPolicy }}
       dnsPolicy: {{ . }}
       {{- end }}
