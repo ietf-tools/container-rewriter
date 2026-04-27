@@ -107,3 +107,15 @@ nodeSelector: {}
 tolerations: []
 
 affinity: {}
+
+filebeat:
+  enabled: false
+  tlsCA: false
+  logstashHost: 127.0.0.1
+  logstashPort: 5044
+  logstashTags:
+    - rewriter
+    - k8s
+  filePaths:
+    - /var/log/rewrite.log
+
