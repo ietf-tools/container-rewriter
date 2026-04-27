@@ -69,6 +69,9 @@ spec:
               protocol: TCP
             - containerPort: 8000
               protocol: TCP
+          volumeMounts:
+            - name: logs
+              mountPath: /var/log
           {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
@@ -81,6 +84,45 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+      {{- if .Values.filebeat.enabled }}
+      initContainers:
+      - name: filebeat
+        image: elastic/filebeat:9.3.1
+        imagePullPolicy: IfNotPresent
+        restartPolicy: Always
+        args:
+          - -c
+          - /etc/filebeat.yml
+          - -e
+        volumeMounts:
+          - name: logs
+            mountPath: /var/log
+          - name: filebeat-config
+            mountPath: /etc/filebeat.yml
+            subPath: filebeat.yml
+            readOnly: true
+          {{- if .Values.filebeat.tlsCA }}
+          - name: filebeat-ca
+            mountPath: /etc/filebeat/ca.pem
+            subPath: ca.pem
+            readOnly: true
+          {{- end }}
+      volumes:
+        - name: logs
+          emptyDir: {}
+        {{- if .Values.filebeat.enabled }}
+        - name: filebeat-config
+          configMap:
+            name: {{ include "rewriter.fullname" . }}-filebeat-config
+            defaultMode: 0444
+        {{- if .Values.filebeat.tlsCA }}
+        - name: filebeat-ca
+          configMap:
+            name: {{ include "rewriter.fullname" . }}-filebeat-ca
+            defaultMode: 0444
+        {{- end }}
+        {{- end }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
