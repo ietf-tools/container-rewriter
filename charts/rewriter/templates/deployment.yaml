@@ -107,6 +107,7 @@ spec:
             subPath: ca.pem
             readOnly: true
           {{- end }}
+      {{- end }}
       volumes:
         - name: logs
           emptyDir: {}
@@ -122,7 +123,6 @@ spec:
             defaultMode: 0444
         {{- end }}
         {{- end }}
-      {{- end }}
       {{- with .Values.dnsPolicy }}
       dnsPolicy: {{ . }}
       {{- end }}
