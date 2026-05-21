@@ -110,6 +110,7 @@ affinity: {}
 
 filebeat:
   enabled: false
+  filebeatVersion: 9.3.3
   tlsCA: false
   logstashHost: 127.0.0.1
   logstashPort: 5044

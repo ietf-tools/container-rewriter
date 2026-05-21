@@ -87,7 +87,7 @@ spec:
       {{- if .Values.filebeat.enabled }}
       initContainers:
       - name: filebeat
-        image: elastic/filebeat:9.3.1
+        image: elastic/filebeat:{{ .Values.filebeat.filebeatVersion }}
         imagePullPolicy: IfNotPresent
         restartPolicy: Always
         args:
