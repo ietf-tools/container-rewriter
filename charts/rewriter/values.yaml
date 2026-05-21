@@ -113,6 +113,7 @@ filebeat:
   tlsCA: false
   logstashHost: 127.0.0.1
   logstashPort: 5044
+  loggingHostname: my-rewriter
   logstashTags:
     - rewriter
     - k8s

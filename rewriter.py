@@ -21,21 +21,15 @@ local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
 milter_listening_port = os.environ.get("LISTENING_PORT", "8800")
 http_listening_port = os.environ.get("HTTP_LISTENING_PORT", 8000)
 log_level = os.environ.get("LOG_LEVEL", "INFO")
-logging_hostname = os.environ.get("LOGGING_HOSTNAME", "mx-slush")
 logging_procname = os.environ.get("LOGGING_PROCNAME", "milter/rewriter")
 logging_filename = os.environ.get("LOGGING_FILENAME", "/var/log/rewrite.log")
 logging_rotate_period = os.environ.get("LOGGING_ROTATE_PERIOD", "D")
-logging_format = "{asctime} {logging_hostname} milter/rewriter[{process}]: {message} [{filename}:{lineno}]"
+logging_format = "{asctime} milter/rewriter[{process}]: {message} [{filename}:{lineno}]"
 
 mailmatch = re.compile(
     r"[-A-Za-z0-9!#$%&'*+/=?^_`{|}~]+(?:\.[-A-Za-z0-9!#$%&'*+/=?^_`{|}~]+)*=40(?:[A-Za-z0-9](?:[-A-Za-z0-9]*[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[-A-Za-z0-9]*[A-Za-z0-9])?",
     re.IGNORECASE,
 )
-
-log_const = {
-    "logging_hostname": logging_hostname,
-    "logging_procname": logging_procname,
-}
 
 logging.basicConfig(
     level=log_level,
@@ -59,8 +53,7 @@ file_formatter = logging.Formatter(
 file_handler.setFormatter(file_formatter)
 
 logger.addHandler(file_handler)
-logging = logging.LoggerAdapter(logger, log_const)
-
+logging = logging.LoggerAdapter(logger)
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
