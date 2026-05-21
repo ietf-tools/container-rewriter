@@ -17,6 +17,11 @@ data:
         {{- with .Values.filebeat.filePaths }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+      processors:
+      - add_fields:
+          target: ''
+          fields:
+            hostname: "{{ .Values.filebeat.loggingHostname }}"
     output:
       logstash:
         enabled: true
