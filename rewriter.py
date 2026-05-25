@@ -163,7 +163,6 @@ def unwrap_address(email_addr, domain):
         wrapped_addr = email_addr.split("@")[0]
         if mailmatch.match(wrapped_addr):
             return wrapped_addr.replace("=40", "@")
-        return email_addr
     return email_addr
 
 
