@@ -158,14 +158,6 @@ def check_wrapped(email_addr, domain):
     return False
 
 
-def unwrap_address(email_addr, domain):
-    if email_addr.split("@")[-1] == forwarding_domain:
-        wrapped_addr = email_addr.split("@")[0]
-        if mailmatch.match(wrapped_addr):
-            return wrapped_addr.replace("=40", "@")
-    return email_addr
-
-
 def check_local(email_addr):
     try:
         local_domain_list = local_domains.split(" ")
