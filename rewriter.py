@@ -179,6 +179,8 @@ class EnvelopeMilter(Milter.Base):
         self.id = Milter.uniqueID()
         self.mail_from = None
         self.header_from = None
+        self.mail_to = None
+        self.header_to = None
 
     def envfrom(self, f, *str):
         self.mail_from = f
