@@ -125,6 +125,8 @@ def test_virtual_alias(email_addr):
 
 def check_dmarc(email_addr):
     matches = ["reject", "quarantine"]
+    if not email_addr or "@" not in email_addr:
+        return False
     domain = email_addr.split("@")[1].replace(">", "")
     dmarc_status = checkdmarc.check_dmarc(domain)
     if "tags" in dmarc_status:
@@ -136,6 +138,8 @@ def check_dmarc(email_addr):
 
 def check_spf(email_addr):
     matches = ["softfail", "fail"]
+    if not email_addr or "@" not in email_addr:
+        return False
     domain = email_addr.split("@")[1]
     spf_status = checkdmarc.check_spf(domain)
     if "parsed" in spf_status:
