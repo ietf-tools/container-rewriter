@@ -155,8 +155,7 @@ def check_wrapped(email_addr, domain):
         if mailmatch.match(wrapped_addr):
             unwrapped_addr = wrapped_addr.replace("=40", "@")
             return unwrapped_addr
-    else:
-        return False
+    return False
 
 
 def unwrap_address(email_addr, domain):
