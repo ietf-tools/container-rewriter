@@ -162,10 +162,9 @@ def unwrap_address(email_addr, domain):
     if email_addr.split("@")[-1] == forwarding_domain:
         wrapped_addr = email_addr.split("@")[0]
         if mailmatch.match(wrapped_addr):
-            unwrapped_addr = wrapped_addr.replace("=40", "@")
-        else:
-            unwrapped_addr = email_addr
-    return unwrapped_addr
+            return wrapped_addr.replace("=40", "@")
+        return email_addr
+    return email_addr
 
 
 def check_local(email_addr):
