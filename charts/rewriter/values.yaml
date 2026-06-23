@@ -14,6 +14,8 @@ rewriter:
   listeningPort: 8800
   localDomains:
     - myaddr.com
+  rewriteDomains:
+    lists.myaddr.com: dmarc.myaddr.com
   database:
     host:
       existingSecretName: db-app

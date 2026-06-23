@@ -18,6 +18,12 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
 forwarding_domain = os.environ.get("FORWARDING_DOMAIN", "myaddr.com")
 local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
+rewrite_domains = os.environ.get("REWRITE_DOMAINS", "map[mydomain.com:dmarc.mydomain.com]")
+
+rewrite_domain_map = {
+    x.split(":")[0]: x.split(":")[1] for x in rewrite_domains[4:-1].split(" ")
+}
+
 milter_listening_port = os.environ.get("LISTENING_PORT", "8800")
 http_listening_port = os.environ.get("HTTP_LISTENING_PORT", 8000)
 log_level = os.environ.get("LOG_LEVEL", "INFO")
@@ -26,10 +32,11 @@ logging_filename = os.environ.get("LOGGING_FILENAME", "/var/log/rewrite.log")
 logging_rotate_period = os.environ.get("LOGGING_ROTATE_PERIOD", "D")
 logging_format = "{asctime} milter/rewriter[{process}]: {message} [{filename}:{lineno}]"
 
-mailmatch = re.compile(
-    r"[-A-Za-z0-9!#$%&'*+/=?^_`{|}~]+(?:\.[-A-Za-z0-9!#$%&'*+/=?^_`{|}~]+)*=40(?:[A-Za-z0-9](?:[-A-Za-z0-9]*[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[-A-Za-z0-9]*[A-Za-z0-9])?",
-    re.IGNORECASE,
-)
+wrapped_regex = f"[-a-zA-Z0-9._%+]+=40[-a-zA-Z0-9.]+@{forwarding_domain}"
+wrapped_mailmatch = re.compile(wrapped_regex, re.IGNORECASE)
+
+listbounce_regex = "^[-_.0-9a-z]+-bounces+[-a-zA-Z0-9._%+]+=[-a-zA-Z0-9.]+"
+listbounce_mailmatch = re.compile(listbounce_regex, re.IGNORECASE)
 
 logging.basicConfig(
     level=log_level,
@@ -117,7 +124,7 @@ def test_virtual_alias(email_addr):
             with connection.cursor() as cur:
                 cur.execute("SELECT email from virtual where email = %s", (email_addr,))
                 result = cur.fetchall()
-    if len(result) == 1:
+    if len(result) > 0:
         return True
     else:
         return False
@@ -144,27 +151,6 @@ def check_spf(email_addr):
     else:
         return False
 
-
-def check_wrapped(email_addr, domain):
-    if email_addr.split("@")[-1] == domain:
-        wrapped_addr = email_addr.split("@")[0]
-        if mailmatch.match(wrapped_addr):
-            unwrapped_addr = wrapped_addr.replace("=40", "@")
-            return unwrapped_addr
-    else:
-        return False
-
-
-def unwrap_address(email_addr, domain):
-    if email_addr.split("@")[-1] == forwarding_domain:
-        wrapped_addr = email_addr.split("@")[0]
-        if mailmatch.match(wrapped_addr):
-            unwrapped_addr = wrapped_addr.replace("=40", "@")
-        else:
-            unwrapped_addr = email_addr
-    return unwrapped_addr
-
-
 def check_local(email_addr):
     try:
         local_domain_list = local_domains.split(" ")
@@ -173,6 +159,21 @@ def check_local(email_addr):
     except AttributeError:
         return False
 
+def update_addr_wrap_log(email_addr, new_email_addr):
+    update_addr_wrap_log = f"""
+    INSERT INTO virtual (email, destination, transport, source)
+    VALUES ('{new_email_addr}', '{email_addr}', 'relay:', 'rewriter')
+    ON CONFLICT (email) DO
+    UPDATE SET updated = now();
+    """
+    try:
+        with get_db_pool() as pool:
+            with pool.connection() as connection:
+                with connection.cursor() as cur:
+                    cur.execute(update_addr_wrap_log)
+    except psycopg.OperationalError as e:
+        logging.info(f"failed to update addr_wrap_log: {e}")
+    return True
 
 class EnvelopeMilter(Milter.Base):
     def __init__(self):
@@ -212,16 +213,44 @@ class EnvelopeMilter(Milter.Base):
             queue_id = self.getsymval('i') # authenticated user
 
             # scenario 1
-            if unwrapped_addr := check_wrapped(env_to_addr, forwarding_domain):
+            if wrapped_mailmatch.match(env_to_addr):
+                unwrapped_addr = env_to_addr.split("@")[0].replace("=40", "@")
+                try:
+                    with get_db_pool() as pool:
+                        with pool.connection() as connection:
+                            with connection.cursor() as cur:
+                                cur.execute(f"""
+                                            SELECT email FROM
+                                            virtual WHERE email = '{env_to_addr}' and
+                                            updated >= NOW() - INTERVAL '7 DAYS';
+                                            """)
+                                valid_unwraps = cur.fetchall()
+                except psycopg.OperationalError as e:
+                    logging.info(f"failed to find valid rewrite: {e}")
+                except psycopg.ProgrammingError as e:
+                    logging.info(f"failed to find valid rewrite: {e}")
                 logging.debug(
                     f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
                 )
                 logging.info(
                     f"{queue_id} unwrap: from {env_to_addr} to {unwrapped_addr} [{self.id}]"
                 )
+                if len(valid_unwraps) > 0:
+                    self.delrcpt(env_to_addr)
+                    self.addrcpt(f"<{unwrapped_addr}>")
+                    return Milter.ACCEPT
+                else:
+                    logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {env_to_addr}")
+                    return Milter.REJECT
+            elif listbounce_mailmatch.match(env_to_addr):
+                unwrapped_domain = [key for key, val in rewrite_domain_map.items() if val == env_to_addr.split('@')[1]][0]
+                unwrapped_addr = env_to_addr.split("@")[1].replace(env_to_addr.split('@')[1], unwrapped_domain)
+                logging.info(f"{queue_id} unwrap: list bounce unwrapped from {env_to_addr} to {unwrapped_addr}")
+
                 self.delrcpt(env_to_addr)
                 self.addrcpt(f"<{unwrapped_addr}>")
                 return Milter.ACCEPT
+
             # scenario 2
             elif check_local(env_to_addr) and not test_virtual_alias(env_to_addr):
                 logging.info(
@@ -236,6 +265,8 @@ class EnvelopeMilter(Milter.Base):
                     new_hdr_from_addr = (
                         f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
                     )
+                    update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
+                    forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
                     self.chgfrom(forwarding_addr)
                     self.chgheader(
                         "From",
@@ -264,24 +295,29 @@ class EnvelopeMilter(Milter.Base):
             # no scenario match
             else:
                 logging.debug(f"{queue_id} debug: Fall through [{self.id}]")
+                rewrite_domain = rewrite_domain_map[env_from_addr.split("@")[1]]
+                logging.info(f"rewrite domain is {rewrite_domain}")
                 if check_dmarc(hdr_from_addr):
                     new_hdr_from_addr = (
                         f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
                     )
-                    self.chgfrom(forwarding_addr)
                     self.chgheader(
                         "From",
                         0,
                         new_hdr_from_addr,
                     )
+                    update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
+                    new_forwarding_addr = re.sub('@.*', '@' + rewrite_domain, env_from_addr)
+                    self.chgfrom(new_forwarding_addr)
                     logging.info(
-                        f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr} to {forwarding_addr} header-From changed from {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
+                        f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr} to {new_forwarding_addr} header-From changed from {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
                     )
                 elif check_spf(hdr_from_addr):
                     logging.info(
                         f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: {env_from_addr} [{self.id}]"
                     )
-                    self.chgfrom(forwarding_addr)
+                    new_forwarding_addr = re.sub('@.*', '@' + rewrite_domain, env_from_addr)
+                    self.chgfrom(new_forwarding_addr)
                 else:
                     logging.info(
                         f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} [{self.id}]"

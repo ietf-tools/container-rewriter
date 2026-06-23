@@ -44,6 +44,8 @@ spec:
               value: {{ .Values.rewriter.forwardingDomain }}
             - name: LOCAL_DOMAINS
               value: "{{ .Values.rewriter.localDomains | join " " }}"
+            - name: REWRITE_DOMAINS
+              value: {{ .Values.rewriter.rewriteDomains }}
             - name: DB_HOST
               valueFrom:
                 secretKeyRef:
