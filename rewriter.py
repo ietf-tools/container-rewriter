@@ -197,6 +197,7 @@ class EnvelopeMilter(Milter.Base):
         return Milter.CONTINUE
 
     def eom(self):
+        queue_id = self.getsymval('i') or ''  # authenticated user
         try:
             logging.debug(
                 f"[{self.id}] Envelope-From: {self.mail_from}, Header-From: {self.header_from or 'N/A'}"
@@ -210,7 +211,6 @@ class EnvelopeMilter(Milter.Base):
             env_from_addr = email.utils.parseaddr(self.mail_from)[1]
             hdr_to_addr = email.utils.parseaddr(self.header_to)
             env_to_addr = email.utils.parseaddr(self.mail_to)[1]
-            queue_id = self.getsymval('i') # authenticated user
 
             # scenario 1
             if wrapped_mailmatch.match(env_to_addr):
@@ -225,10 +225,9 @@ class EnvelopeMilter(Milter.Base):
                                             updated >= NOW() - INTERVAL '7 DAYS';
                                             """)
                                 valid_unwraps = cur.fetchall()
-                except psycopg.OperationalError as e:
-                    logging.info(f"failed to find valid rewrite: {e}")
-                except psycopg.ProgrammingError as e:
-                    logging.info(f"failed to find valid rewrite: {e}")
+                except (psycopg.OperationalError, psycopg.ProgrammingError) as e:
+                    logging.info(f"{queue_id} unwrap: DB error validating {env_to_addr}, failing closed: {e} [{self.id}]")
+                    return Milter.TEMPFAIL
                 logging.debug(
                     f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
                 )
