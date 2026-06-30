@@ -295,7 +295,10 @@ class EnvelopeMilter(Milter.Base):
             # no scenario match
             else:
                 logging.debug(f"{queue_id} debug: Fall through [{self.id}]")
-                rewrite_domain = rewrite_domain_map[env_from_addr.split("@")[1]]
+                rewrite_domain = rewrite_domain_map.get(env_from_addr.split("@")[1])
+                if rewrite_domain is None:
+                    logging.info(f"{queue_id} none: sender {env_from_addr} not a rewrite domain, no action [{self.id}]")
+                    return Milter.CONTINUE
                 logging.info(f"rewrite domain is {rewrite_domain}")
                 if check_dmarc(hdr_from_addr):
                     new_hdr_from_addr = (
