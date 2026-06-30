@@ -35,7 +35,8 @@ logging_format = "{asctime} milter/rewriter[{process}]: {message} [{filename}:{l
 wrapped_regex = f"[-a-zA-Z0-9._%+]+=40[-a-zA-Z0-9.]+@{forwarding_domain}"
 wrapped_mailmatch = re.compile(wrapped_regex, re.IGNORECASE)
 
-listbounce_regex = "^[-_.0-9a-z]+-bounces+[-a-zA-Z0-9._%+]+=[-a-zA-Z0-9.]+"
+rewrite_domain_alt = "|".join(re.escape(d) for d in rewrite_domain_map.values())
+listbounce_regex = r"^[-_.0-9a-z]+-bounces\+[-a-zA-Z0-9._%+]+=[-a-zA-Z0-9.]+@(?:" + rewrite_domain_alt + r")$"
 listbounce_mailmatch = re.compile(listbounce_regex, re.IGNORECASE)
 
 logging.basicConfig(
@@ -243,8 +244,14 @@ class EnvelopeMilter(Milter.Base):
                     logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {env_to_addr}")
                     return Milter.REJECT
             elif listbounce_mailmatch.match(env_to_addr):
-                unwrapped_domain = [key for key, val in rewrite_domain_map.items() if val == env_to_addr.split('@')[1]][0]
-                unwrapped_addr = env_to_addr.split("@")[1].replace(env_to_addr.split('@')[1], unwrapped_domain)
+                localpart, domain = env_to_addr.rsplit("@", 1)
+                unwrapped_domain = next(
+                    (k for k, v in rewrite_domain_map.items() if v == domain), None
+                )
+                if unwrapped_domain is None:
+                    logging.info(f"{queue_id} unwrap: list bounce to non-rewrite domain {env_to_addr}, no action [{self.id}]")
+                    return Milter.CONTINUE
+                unwrapped_addr = f"{localpart}@{unwrapped_domain}"
                 logging.info(f"{queue_id} unwrap: list bounce unwrapped from {env_to_addr} to {unwrapped_addr}")
 
                 self.delrcpt(env_to_addr)
