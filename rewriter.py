@@ -160,9 +160,9 @@ def check_local(email_addr):
         return False
 
 def update_addr_wrap_log(email_addr, new_email_addr):
-    update_addr_wrap_log = f"""
+    update_addr_wrap_log = """
     INSERT INTO virtual (email, destination, transport, source)
-    VALUES ('{new_email_addr}', '{email_addr}', 'relay:', 'rewriter')
+    VALUES (%s, %s, 'relay:', 'rewriter')
     ON CONFLICT (email) DO
     UPDATE SET updated = now();
     """
@@ -170,7 +170,7 @@ def update_addr_wrap_log(email_addr, new_email_addr):
         with get_db_pool() as pool:
             with pool.connection() as connection:
                 with connection.cursor() as cur:
-                    cur.execute(update_addr_wrap_log)
+                    cur.execute(update_addr_wrap_log, (new_email_addr, email_addr))
     except psycopg.OperationalError as e:
         logging.info(f"failed to update addr_wrap_log: {e}")
     return True
@@ -219,11 +219,11 @@ class EnvelopeMilter(Milter.Base):
                     with get_db_pool() as pool:
                         with pool.connection() as connection:
                             with connection.cursor() as cur:
-                                cur.execute(f"""
+                                cur.execute("""
                                             SELECT email FROM
-                                            virtual WHERE email = '{env_to_addr}' and
+                                            virtual WHERE email = %s and
                                             updated >= NOW() - INTERVAL '7 DAYS';
-                                            """)
+                                            """, (env_to_addr,))
                                 valid_unwraps = cur.fetchall()
                 except psycopg.OperationalError as e:
                     logging.info(f"failed to find valid rewrite: {e}")
