@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
-import checkdmarc
-import threading
-import logging
-from logging.handlers import TimedRotatingFileHandler
-
-import Milter
-
 import email.utils
+import logging
 import os
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import TimedRotatingFileHandler
 
-from psycopg_pool import ConnectionPool
+import checkdmarc
+import Milter
 import psycopg
-
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from psycopg_pool import ConnectionPool
 
 forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
 forwarding_domain = os.environ.get("FORWARDING_DOMAIN", "myaddr.com")
 local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
 rewrite_domains = os.environ.get("REWRITE_DOMAINS", "map[mydomain.com:dmarc.mydomain.com]")
 
+
 rewrite_domain_map = {
     x.split(":")[0]: x.split(":")[1] for x in rewrite_domains[4:-1].split(" ")
 }
 
+rewrite_domain_reverse_map = dict(map(reversed,rewrite_domain_map.items()))
+
 milter_listening_port = os.environ.get("LISTENING_PORT", "8800")
-http_listening_port = os.environ.get("HTTP_LISTENING_PORT", 8000)
+http_listening_port = os.environ.get("HTTP_LISTENING_PORT", "8000")
 log_level = os.environ.get("LOG_LEVEL", "INFO")
 logging_procname = os.environ.get("LOGGING_PROCNAME", "milter/rewriter")
 logging_filename = os.environ.get("LOGGING_FILENAME", "/var/log/rewrite.log")
@@ -35,7 +35,7 @@ logging_format = "{asctime} milter/rewriter[{process}]: {message} [{filename}:{l
 wrapped_regex = f"[-a-zA-Z0-9._%+]+=40[-a-zA-Z0-9.]+@{forwarding_domain}"
 wrapped_mailmatch = re.compile(wrapped_regex, re.IGNORECASE)
 
-listbounce_regex = "^[-_.0-9a-z]+-bounces+[-a-zA-Z0-9._%+]+=[-a-zA-Z0-9.]+"
+listbounce_regex = "^[-_.0-9a-z]+-bounces+"
 listbounce_mailmatch = re.compile(listbounce_regex, re.IGNORECASE)
 
 logging.basicConfig(
@@ -71,18 +71,16 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/healthz":
             try:
-                with get_db_pool() as pool:
-                    with pool.connection() as connection:
-                        with connection.cursor() as cur:
-                            cur.execute("SELECT email from virtual LIMIT 1")
-                            cur.fetchall()
-                            self.send_response(200)
-                            self.send_header("Content-type", "text/plain")
-                            self.end_headers()
-                            try:
-                                self.wfile.write(b"OK")
-                            except BrokenPipeError as e:
-                                logging.debug(f"Client timeout: {e}")
+                with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
+                    cur.execute("SELECT email from virtual LIMIT 1")
+                    cur.fetchall()
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/plain")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(b"OK")
+                    except BrokenPipeError as e:
+                        logging.debug(f"Client timeout: {e}")
             except psycopg.OperationalError:
                 self.send_response(400)
                 # Set the response headers
@@ -113,27 +111,23 @@ def get_db_pool() -> ConnectionPool:
         )
     except psycopg.OperationalError as e:
         logging.info(f"DB Error: {e}")
-        raise e
+        raise
     pool.open(wait=True)
     return pool
 
 
 def test_virtual_alias(email_addr):
-    with get_db_pool() as pool:
-        with pool.connection() as connection:
-            with connection.cursor() as cur:
-                cur.execute("SELECT email from virtual where email = %s", (email_addr,))
-                result = cur.fetchall()
-    if len(result) > 0:
-        return True
-    else:
-        return False
+    with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
+        cur.execute("SELECT email from virtual where email = %s", (email_addr.lower(),))
+        result = cur.fetchall()
+    return len(result) > 0
 
 
 def check_dmarc(email_addr):
     matches = ["reject", "quarantine"]
-    domain = email_addr.split("@")[1].replace(">", "")
+    domain = email_addr.rsplit("@")[-1].lower()
     dmarc_status = checkdmarc.check_dmarc(domain)
+    logging.debug(f"dmarc status is {dmarc_status}")
     if "tags" in dmarc_status:
         if any(x in dmarc_status["tags"]["p"]["value"] for x in matches):
             return True
@@ -143,8 +137,9 @@ def check_dmarc(email_addr):
 
 def check_spf(email_addr):
     matches = ["softfail", "fail"]
-    domain = email_addr.split("@")[1]
+    domain = email_addr.rsplit("@")[-1].lower()
     spf_status = checkdmarc.check_spf(domain)
+    logging.debug(f"spf status is {spf_status}")
     if "parsed" in spf_status:
         if any(x in spf_status["parsed"]["all"] for x in matches):
             return True
@@ -152,25 +147,20 @@ def check_spf(email_addr):
         return False
 
 def check_local(email_addr):
-    try:
-        local_domain_list = local_domains.split(" ")
-        domain = email_addr.split("@")[-1]
-        return bool(len(set(local_domain_list).intersection(set(domain.split(" ")))))
-    except AttributeError:
-        return False
+    local_domain_list = local_domains.split(" ")
+    domain = email_addr.rsplit("@")[-1].lower()
+    return domain in local_domain_list
 
 def update_addr_wrap_log(email_addr, new_email_addr):
-    update_addr_wrap_log = f"""
+    update_addr_wrap_log = """
     INSERT INTO virtual (email, destination, transport, source)
-    VALUES ('{new_email_addr}', '{email_addr}', 'relay:', 'rewriter')
+    VALUES (%s, %s, 'relay:', 'rewriter')
     ON CONFLICT (email) DO
     UPDATE SET updated = now();
     """
     try:
-        with get_db_pool() as pool:
-            with pool.connection() as connection:
-                with connection.cursor() as cur:
-                    cur.execute(update_addr_wrap_log)
+        with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
+            cur.execute(update_addr_wrap_log, (new_email_addr, email_addr,))
     except psycopg.OperationalError as e:
         logging.info(f"failed to update addr_wrap_log: {e}")
     return True
@@ -206,7 +196,7 @@ class EnvelopeMilter(Milter.Base):
                 f"[{self.id}] Envelope-To: {self.mail_to or 'N/A'}, Header-To: {self.header_to or 'N/A'}"
             )
 
-            hdr_from_name, hdr_from_addr = email.utils.parseaddr(self.header_from)
+            _hdr_from_name, hdr_from_addr = email.utils.parseaddr(self.header_from)
             env_from_addr = email.utils.parseaddr(self.mail_from)[1]
             hdr_to_addr = email.utils.parseaddr(self.header_to)
             env_to_addr = email.utils.parseaddr(self.mail_to)[1]
@@ -214,17 +204,15 @@ class EnvelopeMilter(Milter.Base):
 
             # scenario 1
             if wrapped_mailmatch.match(env_to_addr):
-                unwrapped_addr = env_to_addr.split("@")[0].replace("=40", "@")
+                unwrapped_addr = env_to_addr.rsplit('@', 1)[0].replace('=40', '@')
                 try:
-                    with get_db_pool() as pool:
-                        with pool.connection() as connection:
-                            with connection.cursor() as cur:
-                                cur.execute(f"""
-                                            SELECT email FROM
-                                            virtual WHERE email = '{env_to_addr}' and
-                                            updated >= NOW() - INTERVAL '7 DAYS';
-                                            """)
-                                valid_unwraps = cur.fetchall()
+                    with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
+                        cur.execute("""
+                                    SELECT email FROM
+                                    virtual WHERE email = %s and
+                                    updated >= NOW() - INTERVAL '7 DAYS';
+                                    """, (env_to_addr,))
+                        valid_unwraps = cur.fetchall()
                 except psycopg.OperationalError as e:
                     logging.info(f"failed to find valid rewrite: {e}")
                 except psycopg.ProgrammingError as e:
@@ -243,8 +231,7 @@ class EnvelopeMilter(Milter.Base):
                     logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {env_to_addr}")
                     return Milter.REJECT
             elif listbounce_mailmatch.match(env_to_addr):
-                unwrapped_domain = [key for key, val in rewrite_domain_map.items() if val == env_to_addr.split('@')[1]][0]
-                unwrapped_addr = env_to_addr.split("@")[1].replace(env_to_addr.split('@')[1], unwrapped_domain)
+                unwrapped_addr = env_to_addr.rsplit('@', 1)[0].replace('=40', '@')
                 logging.info(f"{queue_id} unwrap: list bounce unwrapped from {env_to_addr} to {unwrapped_addr}")
 
                 self.delrcpt(env_to_addr)
@@ -262,9 +249,7 @@ class EnvelopeMilter(Milter.Base):
                     f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr} [{self.id}]"
                 )
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = (
-                        f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
-                    )
+                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
                     update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
                     forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
                     self.chgfrom(forwarding_addr)
@@ -295,19 +280,22 @@ class EnvelopeMilter(Milter.Base):
             # no scenario match
             else:
                 logging.debug(f"{queue_id} debug: Fall through [{self.id}]")
-                rewrite_domain = rewrite_domain_map[env_from_addr.split("@")[1]]
+                logging.debug(f"{queue_id} debug: env_from is {env_from_addr} [{self.id}]")
+                logging.debug(f"{queue_id} debug: rewrite_domains are {rewrite_domain_map} [{self.id}]")
+                try:
+                    rewrite_domain = rewrite_domain_map[env_from_addr.rsplit("@", 1)[-1]]
+                except KeyError:
+                    rewrite_domain = forwarding_domain
                 logging.info(f"rewrite domain is {rewrite_domain}")
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = (
-                        f"{hdr_from_addr.replace('@', '=40')}@{forwarding_domain}"
-                    )
+                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
                     self.chgheader(
                         "From",
                         0,
                         new_hdr_from_addr,
                     )
                     update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
-                    new_forwarding_addr = re.sub('@.*', '@' + rewrite_domain, env_from_addr)
+                    new_forwarding_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{rewrite_domain}', env_from_addr)
                     self.chgfrom(new_forwarding_addr)
                     logging.info(
                         f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr} to {new_forwarding_addr} header-From changed from {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
@@ -316,7 +304,7 @@ class EnvelopeMilter(Milter.Base):
                     logging.info(
                         f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: {env_from_addr} [{self.id}]"
                     )
-                    new_forwarding_addr = re.sub('@.*', '@' + rewrite_domain, env_from_addr)
+                    new_forwarding_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{rewrite_domain}', env_from_addr)
                     self.chgfrom(new_forwarding_addr)
                 else:
                     logging.info(
@@ -324,7 +312,7 @@ class EnvelopeMilter(Milter.Base):
                     )
                 return Milter.ACCEPT
 
-        except Exception as e:
+        except TypeError as e:
             logging.info(f"{queue_id} error: writing log: {e} [{self.id}]")
         return Milter.CONTINUE
 
@@ -339,7 +327,7 @@ def main():
         Milter.runmilter("EnvelopeMilter", "inet:" + milter_listening_port, timeout)
 
     def run_http():
-        server_address = ("", http_listening_port)
+        server_address = ("", int(http_listening_port))
         # Create an instance of the threaded HTTP server
         httpd = ThreadingHTTPServer(server_address, SimpleHTTPRequestHandler)
         httpd.serve_forever()
