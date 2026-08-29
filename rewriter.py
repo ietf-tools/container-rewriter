@@ -251,7 +251,6 @@ class EnvelopeMilter(Milter.Base):
                 if check_dmarc(hdr_from_addr):
                     new_hdr_from_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
                     update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
-                    forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
                     self.chgfrom(forwarding_addr)
                     self.chgheader(
                         "From",
@@ -343,11 +342,11 @@ def main():
 
 if __name__ == "__main__":
     logging.info(
-        f"info: Starting, milter interface listneing on {milter_listening_port}"
+        f"info: Starting, milter interface listening on {milter_listening_port}"
     )
-    logging.info(f"info: http interface listneing on {http_listening_port}")
+    logging.info(f"info: http interface listening on {http_listening_port}")
     logging.info(f"info: Local domains are: {local_domains}")
-    logging.info(f"info: logging rotation perdiod is {logging_rotate_period}")
+    logging.info(f"info: logging rotation period is {logging_rotate_period}")
 
     main()
 
