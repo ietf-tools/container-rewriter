@@ -250,7 +250,7 @@ class EnvelopeMilter(Milter.Base):
                 )
                 forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
+                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{hdr_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
                     update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
                     self.chgfrom(forwarding_addr)
                     self.chgheader(
@@ -288,7 +288,7 @@ class EnvelopeMilter(Milter.Base):
                     rewrite_domain = forwarding_domain
                 logging.info(f"rewrite domain is {rewrite_domain}")
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
+                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{hdr_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
                     self.chgheader(
                         "From",
                         0,
