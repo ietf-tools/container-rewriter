@@ -249,7 +249,7 @@ class EnvelopeMilter(Milter.Base):
                     f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr} [{self.id}]"
                 )
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
+                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{hdr_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
                     update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
                     forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
                     self.chgfrom(forwarding_addr)
@@ -289,7 +289,7 @@ class EnvelopeMilter(Milter.Base):
                     rewrite_domain = forwarding_domain
                 logging.info(f"rewrite domain is {rewrite_domain}")
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
+                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{hdr_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
                     self.chgheader(
                         "From",
                         0,
