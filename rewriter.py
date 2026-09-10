@@ -248,15 +248,15 @@ class EnvelopeMilter(Milter.Base):
                 logging.debug(
                     f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr} [{self.id}]"
                 )
-                forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{hdr_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
+                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
                     update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
+                    forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
                     self.chgfrom(forwarding_addr)
                     self.chgheader(
                         "From",
                         0,
-                        new_hdr_from_addr,
+                        f'{_hdr_from_name} <{new_hdr_from_addr}>',
                     )
                     logging.info(
                         f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr} to {forwarding_addr}, header-from changed {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
@@ -282,17 +282,18 @@ class EnvelopeMilter(Milter.Base):
                 logging.debug(f"{queue_id} debug: Fall through [{self.id}]")
                 logging.debug(f"{queue_id} debug: env_from is {env_from_addr} [{self.id}]")
                 logging.debug(f"{queue_id} debug: rewrite_domains are {rewrite_domain_map} [{self.id}]")
+                logging.debug(f"{queue_id} debug: header from name is {_hdr_from_name} [{self.id}]")
                 try:
                     rewrite_domain = rewrite_domain_map[env_from_addr.rsplit("@", 1)[-1]]
                 except KeyError:
                     rewrite_domain = forwarding_domain
                 logging.info(f"rewrite domain is {rewrite_domain}")
                 if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{hdr_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
+                    new_hdr_from_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
                     self.chgheader(
                         "From",
                         0,
-                        new_hdr_from_addr,
+                        f'{_hdr_from_name} <{new_hdr_from_addr}>',
                     )
                     update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
                     new_forwarding_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{rewrite_domain}', env_from_addr)
