@@ -231,12 +231,16 @@ class EnvelopeMilter(Milter.Base):
                     logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {env_to_addr}")
                     return Milter.REJECT
             elif listbounce_mailmatch.match(env_to_addr):
-                unwrapped_addr = env_to_addr.rsplit('@', 1)[0].replace('=40', '@')
-                logging.info(f"{queue_id} unwrap: list bounce unwrapped from {env_to_addr} to {unwrapped_addr}")
+                if env_to_addr.rsplit('@', 1)[-1] in rewrite_domain_reverse_map:
+                    unwrapped_addr = env_to_addr.rsplit('@', 1)[0].replace('=40', '@')
+                    logging.info(f"{queue_id} unwrap: list bounce unwrapped from {env_to_addr} to {unwrapped_addr}")
 
-                self.delrcpt(env_to_addr)
-                self.addrcpt(f"<{unwrapped_addr}>")
-                return Milter.ACCEPT
+                    self.delrcpt(env_to_addr)
+                    self.addrcpt(f"<{unwrapped_addr}>")
+                    return Milter.ACCEPT
+                else:
+                    logging.info(f"{queue_id} none: list bounce already unwrapped {env_to_addr}")
+                    return Milter.ACCEPT
 
             # scenario 2
             elif check_local(env_to_addr) and not test_virtual_alias(env_to_addr):
