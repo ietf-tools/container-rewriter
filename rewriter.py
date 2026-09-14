@@ -16,6 +16,8 @@ forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.
 forwarding_domain = os.environ.get("FORWARDING_DOMAIN", "myaddr.com")
 local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
 rewrite_domains = os.environ.get("REWRITE_DOMAINS", "map[mydomain.com:dmarc.mydomain.com]")
+ignore_list = os.environ.get("IGNORELIST", "support@ietf.org")
+ignore_list = ignore_list.split(',')
 
 
 rewrite_domain_map = {
@@ -115,13 +117,14 @@ def get_db_pool() -> ConnectionPool:
     pool.open(wait=True)
     return pool
 
-
 def test_virtual_alias(email_addr):
-    with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
-        cur.execute("SELECT email from virtual where email = %s", (email_addr.lower(),))
-        result = cur.fetchall()
-    return len(result) > 0
-
+    if email_addr not in ignore_list:
+        with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
+            cur.execute("SELECT email from virtual where email = %s", (email_addr.lower(),))
+            result = cur.fetchall()
+        return len(result) > 0
+    else:
+        return False
 
 def check_dmarc(email_addr):
     matches = ["reject", "quarantine"]
