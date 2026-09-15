@@ -34,7 +34,7 @@ logging_filename = os.environ.get("LOGGING_FILENAME", "/var/log/rewrite.log")
 logging_rotate_period = os.environ.get("LOGGING_ROTATE_PERIOD", "D")
 logging_format = "{asctime} milter/rewriter[{process}]: {message} [{filename}:{lineno}]"
 
-wrapped_regex = f"[-a-zA-Z0-9._%+]+=40[-a-zA-Z0-9.]+@{forwarding_domain}"
+wrapped_regex = f"[-a-zA-Z0-9._%+]+(?<!-bounce)(?<!-bounces)=40[-a-zA-Z0-9.]+@{forwarding_domain}"
 wrapped_mailmatch = re.compile(wrapped_regex, re.IGNORECASE)
 
 listbounce_regex = "^[-_.0-9a-z]+-bounces+"
