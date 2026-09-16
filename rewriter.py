@@ -264,7 +264,7 @@ class EnvelopeMilter(Milter.Base):
                     self.chgheader(
                         "From",
                         0,
-                        f'{_hdr_from_name} <{new_hdr_from_addr}>',
+                        f'"{_hdr_from_name}" <{new_hdr_from_addr}>',
                     )
                     logging.info(
                         f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr} to {forwarding_addr}, header-from changed {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
@@ -301,7 +301,7 @@ class EnvelopeMilter(Milter.Base):
                     self.chgheader(
                         "From",
                         0,
-                        f'{_hdr_from_name} <{new_hdr_from_addr}>',
+                        f'"{_hdr_from_name}" <{new_hdr_from_addr}>',
                     )
                     update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
                     new_forwarding_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{rewrite_domain}', env_from_addr)
