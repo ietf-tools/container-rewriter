@@ -117,6 +117,13 @@ def get_db_pool() -> ConnectionPool:
     pool.open(wait=True)
     return pool
 
+def test_local_list(email_addr):
+    email_addr = email_addr.lower()
+    with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
+        cur.execute("SELECT list from mailman_lists where list = ANY(%s)", [email_addr.split(',')])
+        result = cur.fetchall()
+        return len(result) > 0
+
 def test_virtual_alias(email_addr):
     if email_addr not in ignore_list:
         with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
@@ -246,7 +253,7 @@ class EnvelopeMilter(Milter.Base):
                     return Milter.ACCEPT
 
             # scenario 2
-            elif check_local(env_to_addr) and not test_virtual_alias(env_to_addr):
+            elif check_local(env_to_addr) and test_local_list(env_to_addr):
                 logging.info(
                     f"{queue_id} none: Local list recipient, no action needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr} [{self.id}]"
                 )
