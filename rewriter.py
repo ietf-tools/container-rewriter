@@ -118,16 +118,16 @@ def get_db_pool() -> ConnectionPool:
     return pool
 
 def test_local_list(email_addr):
-    email_addr = email_addr.lower()
     with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
-        cur.execute("SELECT list from mailman_lists where list = ANY(%s)", [email_addr.split(',')])
+        cur.execute("SELECT list from mailman_lists where list = ANY(%s)", [email_addr])
         result = cur.fetchall()
         return len(result) > 0
 
 def test_virtual_alias(email_addr):
-    if email_addr not in ignore_list:
+    should_ignore = list(set(ignore_list) & set(email_addr))
+    if not should_ignore:
         with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
-            cur.execute("SELECT email from virtual where email = %s", (email_addr.lower(),))
+            cur.execute("SELECT email from virtual where email = ANY(%s)", [email_addr])
             result = cur.fetchall()
         return len(result) > 0
     else:
@@ -178,15 +178,18 @@ def update_addr_wrap_log(email_addr, new_email_addr):
 class EnvelopeMilter(Milter.Base):
     def __init__(self):
         self.id = Milter.uniqueID()
+        self.mail_to = []
         self.mail_from = None
         self.header_from = None
+        self.header_to = None
 
     def envfrom(self, f, *str):
-        self.mail_from = f
+        self.mail_from = f.lower()
         return Milter.CONTINUE
 
     def envrcpt(self, to, *str):
-        self.mail_to = to
+        lower_to = to.lower()
+        self.mail_to.append(email.utils.parseaddr(lower_to)[1])
         return Milter.CONTINUE
 
     def header(self, name, value):
@@ -209,19 +212,19 @@ class EnvelopeMilter(Milter.Base):
             _hdr_from_name, hdr_from_addr = email.utils.parseaddr(self.header_from)
             env_from_addr = email.utils.parseaddr(self.mail_from)[1]
             hdr_to_addr = email.utils.parseaddr(self.header_to)
-            env_to_addr = email.utils.parseaddr(self.mail_to)[1]
+            env_to_addr = email.utils.parseaddr(self.mail_to)
             queue_id = self.getsymval('i') # authenticated user
 
             # scenario 1
-            if wrapped_mailmatch.match(env_to_addr):
-                unwrapped_addr = env_to_addr.rsplit('@', 1)[0].replace('=40', '@')
+            if any((match := wrapped_mailmatch.search(item)) for item in self.mail_to):
+                unwrapped_addr = self.mail_to[0].rsplit('@', 1)[0].replace('=40', '@')
                 try:
                     with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
                         cur.execute("""
                                     SELECT email FROM
                                     virtual WHERE email = %s and
                                     updated >= NOW() - INTERVAL '7 DAYS';
-                                    """, (env_to_addr,))
+                                    """, (self.mail_to[0],))
                         valid_unwraps = cur.fetchall()
                 except psycopg.OperationalError as e:
                     logging.info(f"failed to find valid rewrite: {e}")
@@ -231,36 +234,36 @@ class EnvelopeMilter(Milter.Base):
                     f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
                 )
                 logging.info(
-                    f"{queue_id} unwrap: from {env_to_addr} to {unwrapped_addr} [{self.id}]"
+                    f"{queue_id} unwrap: from {self.mail_to[0]} to {unwrapped_addr} [{self.id}]"
                 )
                 if len(valid_unwraps) > 0:
-                    self.delrcpt(env_to_addr)
+                    self.delrcpt(self.mail_to[0])
                     self.addrcpt(f"<{unwrapped_addr}>")
                     return Milter.ACCEPT
                 else:
-                    logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {env_to_addr}")
+                    logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {self.mail_to[0]}")
                     return Milter.REJECT
-            elif listbounce_mailmatch.match(env_to_addr):
-                if env_to_addr.rsplit('@', 1)[-1] in rewrite_domain_reverse_map:
-                    unwrapped_addr = env_to_addr.rsplit('@', 1)[0].replace('=40', '@')
-                    logging.info(f"{queue_id} unwrap: list bounce unwrapped from {env_to_addr} to {unwrapped_addr}")
+            if any((match := listbounce_mailmatch.search(item)) for item in self.mail_to):
+                if self.mail_to[0].rsplit('@', 1)[-1] in rewrite_domain_reverse_map:
+                    unwrapped_addr = self.mail_to[0].rsplit('@', 1)[0].replace('=40', '@')
+                    logging.info(f"{queue_id} unwrap: list bounce unwrapped from {self.mail_to[0]} to {unwrapped_addr}")
 
-                    self.delrcpt(env_to_addr)
+                    self.delrcpt(self.mail_to[0])
                     self.addrcpt(f"<{unwrapped_addr}>")
                     return Milter.ACCEPT
                 else:
-                    logging.info(f"{queue_id} none: list bounce already unwrapped {env_to_addr}")
+                    logging.info(f"{queue_id} none: list bounce already unwrapped {self.mail_to[0]}")
                     return Milter.ACCEPT
 
             # scenario 2
-            elif check_local(env_to_addr) and test_local_list(env_to_addr):
+            elif test_local_list(self.mail_to):
                 logging.info(
-                    f"{queue_id} none: Local list recipient, no action needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr} [{self.id}]"
+                    f"{queue_id} none: Local list recipient, no action needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
                 )
                 return Milter.ACCEPT
-            elif check_local(env_to_addr) and test_virtual_alias(env_to_addr):
+            elif test_virtual_alias(self.mail_to):
                 logging.debug(
-                    f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {env_to_addr} Header-To: {hdr_to_addr} [{self.id}]"
+                    f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
                 )
                 forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
                 if check_dmarc(hdr_from_addr):
