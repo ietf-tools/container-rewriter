@@ -16,7 +16,7 @@ forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.
 forwarding_domain = os.environ.get("FORWARDING_DOMAIN", "myaddr.com")
 local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
 rewrite_domains = os.environ.get("REWRITE_DOMAINS", "map[mydomain.com:dmarc.mydomain.com]")
-ignore_list = os.environ.get("IGNORELIST", "support@ietf.org")
+ignore_list = os.environ.get("IGNORELIST", "alldanes@lists.sys.slush.ca")
 ignore_list = ignore_list.split(',')
 
 
@@ -329,7 +329,11 @@ class EnvelopeMilter(Milter.Base):
                         f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: {env_from_addr} [{self.id}]"
                     )
                     new_forwarding_addr = re.sub('@[^@]+$', f'=40{env_from_addr.rsplit('@')[-1]}@{rewrite_domain}', env_from_addr)
-                    self.chgfrom(new_forwarding_addr)
+                    try:
+                         self.chgfrom(new_forwarding_addr)
+                    except Exception as e:
+                        logging.info(f"{queue_id} error: chgfrom failed: {e} [{self.id}]")
+                    return Milter.ACCEPT
                 else:
                     logging.info(
                         f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} [{self.id}]"
@@ -345,7 +349,7 @@ def main():
     timeout = 600
 
     Milter.factory = EnvelopeMilter
-    Milter.set_flags(Milter.ADDHDRS)
+    Milter.set_flags(Milter.ADDHDRS | Milter.CHGFROM | Milter.CHGHDRS)
 
     def run_milter():
         Milter.runmilter("EnvelopeMilter", "inet:" + milter_listening_port, timeout)
