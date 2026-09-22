@@ -217,32 +217,35 @@ class EnvelopeMilter(Milter.Base):
 
             # scenario 1
             if any((match := wrapped_mailmatch.search(item)) for item in self.mail_to):
-                unwrapped_addr = self.mail_to[0].rsplit('@', 1)[0].replace('=40', '@')
-                try:
-                    with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
-                        cur.execute("""
-                                    SELECT email FROM
-                                    virtual WHERE email = %s and
-                                    updated >= NOW() - INTERVAL '7 DAYS';
-                                    """, (self.mail_to[0],))
-                        valid_unwraps = cur.fetchall()
-                except psycopg.OperationalError as e:
-                    logging.info(f"failed to find valid rewrite: {e}")
-                except psycopg.ProgrammingError as e:
-                    logging.info(f"failed to find valid rewrite: {e}")
-                logging.debug(
-                    f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
-                )
-                logging.info(
-                    f"{queue_id} unwrap: from {self.mail_to[0]} to {unwrapped_addr} [{self.id}]"
-                )
-                if len(valid_unwraps) > 0:
-                    self.delrcpt(self.mail_to[0])
-                    self.addrcpt(f"<{unwrapped_addr}>")
-                    return Milter.ACCEPT
-                else:
-                    logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {self.mail_to[0]}")
-                    return Milter.REJECT
+                for addr in self.mail_to:
+                    if wrapped_mailmatch.search(addr):
+                        unwrapped_addr = addr.rsplit('@', 1)[0].replace('=40', '@')
+                        try:
+                            with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
+                                cur.execute("""
+                                            SELECT email FROM
+                                            virtual WHERE email = %s and
+                                            updated >= NOW() - INTERVAL '7 DAYS';
+                                            """, (addr,))
+                                valid_unwraps = cur.fetchall()
+                        except psycopg.OperationalError as e:
+                            logging.info(f"failed to find valid rewrite: {e}")
+                            valid_unwraps = []
+                        except psycopg.ProgrammingError as e:
+                            logging.info(f"failed to find valid rewrite: {e}")
+                            valid_unwraps = []
+                        logging.debug(
+                            f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
+                        )
+                        logging.info(
+                            f"{queue_id} unwrap: from {addr} to {unwrapped_addr} [{self.id}]"
+                        )
+                        if len(valid_unwraps) > 0:
+                            self.delrcpt(addr)
+                            self.addrcpt(f"<{unwrapped_addr}>")
+                        else:
+                            logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {addr}")
+                return Milter.ACCEPT
             if any((match := listbounce_mailmatch.search(item)) for item in self.mail_to):
                 if self.mail_to[0].rsplit('@', 1)[-1] in rewrite_domain_reverse_map:
                     unwrapped_addr = self.mail_to[0].rsplit('@', 1)[0].replace('=40', '@')
