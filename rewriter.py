@@ -225,7 +225,7 @@ class EnvelopeMilter(Milter.Base):
                                 cur.execute("""
                                             SELECT email FROM
                                             virtual WHERE email = %s and
-                                            updated >= NOW() - INTERVAL '7 DAYS';
+                                            updated >= NOW() - INTERVAL '30 DAYS';
                                             """, (addr,))
                                 valid_unwraps = cur.fetchall()
                         except psycopg.OperationalError as e:
