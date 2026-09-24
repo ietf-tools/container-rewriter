@@ -18,6 +18,7 @@ local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
 rewrite_domains = os.environ.get("REWRITE_DOMAINS", "map[mydomain.com:dmarc.mydomain.com]")
 ignore_list = os.environ.get("IGNORELIST", "alldanes@lists.sys.slush.ca")
 ignore_list = ignore_list.split(',')
+mailman_sasl_user = os.environ.get("MAILMAN_SASL_USER", "mailman@ietf.org").lower()
 
 
 rewrite_domain_map = {
@@ -214,6 +215,10 @@ class EnvelopeMilter(Milter.Base):
             hdr_to_addr = email.utils.parseaddr(self.header_to)
             env_to_addr = email.utils.parseaddr(self.mail_to)
             queue_id = self.getsymval('i') # authenticated user
+            # mailman batches mix subscribers, so a wrapped recipient in the
+            # batch must not skip the dmarc check below
+            auth_user = (self.getsymval('{auth_authen}') or '').lower()
+            list_fanout = auth_user == mailman_sasl_user and bool(listbounce_mailmatch.search(env_from_addr))
 
             # scenario 1
             if any((match := wrapped_mailmatch.search(item)) for item in self.mail_to):
@@ -243,10 +248,20 @@ class EnvelopeMilter(Milter.Base):
                         if len(valid_unwraps) > 0:
                             self.delrcpt(addr)
                             self.addrcpt(f"<{unwrapped_addr}>")
+                            self.mail_to[self.mail_to.index(addr)] = unwrapped_addr
                         else:
                             logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {addr}")
-                return Milter.ACCEPT
-            if any((match := listbounce_mailmatch.search(item)) for item in self.mail_to):
+                if not list_fanout:
+                    return Milter.ACCEPT
+            if list_fanout:
+                for addr in self.mail_to:
+                    if listbounce_mailmatch.search(addr) and addr.rsplit('@', 1)[-1] in rewrite_domain_reverse_map:
+                        unwrapped_addr = addr.rsplit('@', 1)[0].replace('=40', '@')
+                        logging.info(f"{queue_id} unwrap: list bounce unwrapped from {addr} to {unwrapped_addr}")
+                        self.delrcpt(addr)
+                        self.addrcpt(f"<{unwrapped_addr}>")
+                        self.mail_to[self.mail_to.index(addr)] = unwrapped_addr
+            if not list_fanout and any((match := listbounce_mailmatch.search(item)) for item in self.mail_to):
                 if self.mail_to[0].rsplit('@', 1)[-1] in rewrite_domain_reverse_map:
                     unwrapped_addr = self.mail_to[0].rsplit('@', 1)[0].replace('=40', '@')
                     logging.info(f"{queue_id} unwrap: list bounce unwrapped from {self.mail_to[0]} to {unwrapped_addr}")
