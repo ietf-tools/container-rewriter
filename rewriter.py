@@ -185,6 +185,10 @@ class EnvelopeMilter(Milter.Base):
         self.header_to = None
 
     def envfrom(self, f, *str):
+        # one milter instance serves every message on an SMTP connection
+        self.mail_to = []
+        self.header_from = None
+        self.header_to = None
         self.mail_from = f.lower()
         return Milter.CONTINUE
 
