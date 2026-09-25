@@ -255,6 +255,9 @@ class EnvelopeMilter(Milter.Base):
                             self.mail_to[self.mail_to.index(addr)] = unwrapped_addr
                         else:
                             logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {addr}")
+                            self.delrcpt(addr)
+                            self.addrcpt(f"<{unwrapped_addr}>")
+                            self.mail_to[self.mail_to.index(addr)] = unwrapped_addr
                 if not list_fanout:
                     return Milter.ACCEPT
             if list_fanout:
