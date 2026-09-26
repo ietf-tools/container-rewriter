@@ -21,6 +21,19 @@ recipient changes and database writes.
   # a recipient on the ignore list (overrides IGNORELIST; repeatable)
   ./harness.py --from alice@yahoo.com --to alldanes@lists.sys.slush.ca --ignore alldanes@lists.sys.slush.ca
 
+  # a quoted local part: wrapped as "john smith=40example.com"@<FORWARDING_DOMAIN>
+  ./harness.py --from '"john smith"@example.com' --to bob@example.net --dmarc example.com=reject
+
+  # ...and the reply to it being unwrapped (--virtual takes the unquoted form)
+  ./harness.py --from bob@example.net --to '"john smith=40example.com"@dmarc.ietf.org' \
+      --virtual 'john smith=40example.com@dmarc.ietf.org'
+
+  # a bounce (null sender): the From header may be rewritten, the envelope stays <>
+  ./harness.py -f '' --from MAILER-DAEMON@example.com --to bob@example.net --dmarc example.com=reject
+
+  # a subdomain sender: the parent's record applies, with its sp= policy
+  ./harness.py --from alice@lists.example.com --to bob@example.net --dmarc 'example.com=p=none;sp=reject'
+
   # a bounce coming back to a wrapped list address
   ./harness.py --from MAILER-DAEMON@example.com --to ietf-bounces=40ietf.org@dmarc.ietf.org
 
@@ -249,28 +262,50 @@ class FakeCheckdmarc:
         self.real, self.dmarc, self.spf, self.no_dns = real, dmarc, spf, no_dns
         self.lookups = []
 
-    def _answer(self, kind, domain, pinned, ok, real_fn, kw):
-        value = pinned.get(domain)
+    def _answer(self, kind, domain, pinned, ok, real_fn, kw, walk=False):
+        # walk: like checkdmarc's DMARC tree walk, an unpinned domain takes
+        # the answer pinned on its nearest parent (never a bare TLD)
+        location, value = domain, pinned.get(domain)
+        if value is None and walk:
+            labels = domain.split(".")
+            for i in range(1, len(labels) - 1):
+                parent = ".".join(labels[i:])
+                if parent in pinned:
+                    location, value = parent, pinned[parent]
+                    break
         if value is None and self.no_dns:
             value = "nxdomain"
         if value is None:
             self.lookups.append((kind, domain, "live DNS"))
             return real_fn(domain, **kw)
-        self.lookups.append((kind, domain, value))
+        self.lookups.append((kind, domain, value if location == domain else f"{value} (at {location})"))
         if value in DNS_FAILURES:
             return {"error": DNS_FAILURES[value]}
-        return ok(value)
+        return ok(value, location)
 
     def check_dmarc(self, domain, **kw):
-        return self._answer("dmarc", domain, self.dmarc,
-                            lambda v: {"tags": {"p": {"value": v}}},
-                            self.real.check_dmarc, kw)
+        return self._answer("dmarc", domain, self.dmarc, dmarc_result,
+                            self.real.check_dmarc, kw, walk=True)
 
     def check_spf(self, domain, **kw):
         # checkdmarc reports the "all" mechanism by result name, not qualifier
         return self._answer("spf", domain, self.spf,
-                            lambda v: {"parsed": {"all": SPF_ALL.get(v, v)}},
+                            lambda v, _loc: {"parsed": {"all": SPF_ALL.get(v, v)}},
                             self.real.check_spf, kw)
+
+
+def dmarc_result(value, location):
+    """checkdmarc's result for a pinned policy: 'reject' or 'p=none;sp=reject'."""
+    tags = {}
+    for part in value.split(";"):
+        tag, sep, v = part.strip().partition("=")
+        if part.strip():
+            tags[tag if sep else "p"] = v if sep else tag
+    if "p" not in tags:
+        sys.exit(f"--dmarc policy {value!r} has no p= tag")
+    tags.setdefault("sp", tags["p"])
+    return {"location": location, "valid": True,
+            "tags": {t: {"value": v, "explicit": True} for t, v in tags.items()}}
 
 
 # --- fake milter context -----------------------------------------------------
@@ -414,8 +449,10 @@ def build_parser():
     p = argparse.ArgumentParser(
         description="Run one message through rewriter.py's milter logic offline.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"DNS answers for --dmarc/--spf: a policy (reject, quarantine, none / "
-               f"-all, ~all, ?all, +all or fail, softfail, neutral, pass) or a failure ({', '.join(DNS_FAILURES)}).")
+        epilog=f"DNS answers for --dmarc/--spf: a policy (reject, quarantine, none, or tags such as "
+               f"'p=none;sp=reject' / -all, ~all, ?all, +all or fail, softfail, neutral, pass) "
+               f"or a failure ({', '.join(DNS_FAILURES)}). A --dmarc answer also covers the "
+               f"domain's subdomains, as a parent record would.")
     p.add_argument("--from", dest="source", default="sender@example.com",
                    help="From header, e.g. 'Alice <alice@yahoo.com>' (default: %(default)s)")
     p.add_argument("--to", nargs="+", default=None,
@@ -589,7 +626,9 @@ def main(argv=None):
 
     final_from = env_from
     new_header_from = None
-    rcpts = [r.lower() for r in recipients]
+    # Postfix matches delrcpt() against the recipient exactly as it was given
+    rcpts = list(recipients)
+    warnings = []
     for action in ctx.actions:
         if action[0] == "chgfrom":
             final_from = action[1]
@@ -599,6 +638,9 @@ def main(argv=None):
             addr = email.utils.parseaddr(action[1])[1]
             if addr in rcpts:
                 rcpts.remove(addr)
+            else:
+                warnings.append(f"delrcpt({action[1]!r}) matches no recipient exactly; "
+                                f"the original stays in the message")
         elif action[0] == "addrcpt":
             rcpts.append(email.utils.parseaddr(action[1])[1])
 
@@ -622,6 +664,7 @@ def main(argv=None):
         "db_writes": db.writes,
         "dns_lookups": [list(x) for x in fake_dns.lookups],
         "stubbed_modules": stubbed,
+        "warnings": warnings,
         "exception": error,
     }
     if args.debug:
@@ -644,10 +687,10 @@ def main(argv=None):
     print(f"header From:    {changed(header_from, report['header_from'])}")
     print("recipients:")
     for r in recipients:
-        mark = " " if r.lower() in rcpts else "-"
+        mark = " " if r in rcpts else "-"
         print(f"  {mark} {r}" + ("   (on ignore list)" if r in ignored else ""))
     for r in rcpts:
-        if r not in (x.lower() for x in recipients):
+        if r not in recipients:
             print(f"  + {r}")
     print(f"ignore list:    {', '.join(sorted(ignore_list)) or '(empty)'}")
     if db.writes:
@@ -656,6 +699,8 @@ def main(argv=None):
             print(f"    virtual: {w['email']} -> {w['destination']}")
     if fake_dns.lookups:
         print("dns:            " + ", ".join(f"{k} {d}={a}" for k, d, a in fake_dns.lookups))
+    for w in warnings:
+        print(f"warning:        {w}")
     if stubbed:
         print(f"stubbed:        {', '.join(stubbed)} (not installed)")
     if error:
