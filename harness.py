@@ -492,8 +492,6 @@ def main(argv=None):
 
     for k, v in DEFAULT_ENV.items():
         os.environ.setdefault(k, v)
-    if args.ignore is not None:
-        os.environ["IGNORELIST"] = ",".join(args.ignore)
     os.environ["LOG_LEVEL"] = "DEBUG" if args.verbose else ("WARNING" if args.quiet else "INFO")
     log_dir = tempfile.mkdtemp(prefix="rewriter-harness-")
     os.environ["LOGGING_FILENAME"] = os.path.join(log_dir, "rewrite.log")
@@ -522,7 +520,9 @@ def main(argv=None):
                 virtual=(a.lower() for a in args.virtual),
                 down=args.db_down)
     rewriter.get_db_pool = lambda: db
-    ignore_list = {a.strip().lower() for a in rewriter.ignore_list if a.strip()}
+    # applied on every run, not only at import, so one process can run many
+    ignore_value = ",".join(args.ignore) if args.ignore is not None else os.environ.get("IGNORELIST", "")
+    rewriter.ignore_list = ignore_list = rewriter.parse_ignore_list(ignore_value)
 
     header_from = args.source
     source_addr = email.utils.parseaddr(header_from)[1]
@@ -648,7 +648,7 @@ def main(argv=None):
         relay_sessions(tx, server, client, auth, final_from, rcpts,
                        apply_header_changes(headers, ctx.actions), body, local_domains)
 
-    ignored = [r for r in recipients if r.lower() in ignore_list]
+    ignored = [r for r in recipients if rewriter.internal_addr(r) in ignore_list]
     report = {
         "mode": "list fan-out" if fanout else "single message",
         "ignore_list": sorted(ignore_list),
@@ -662,6 +662,7 @@ def main(argv=None):
         "recipients": rcpts,
         "milter_actions": [list(a) for a in ctx.actions],
         "db_writes": db.writes,
+        "db_queries": [q for q, _params in db.queries],
         "dns_lookups": [list(x) for x in fake_dns.lookups],
         "stubbed_modules": stubbed,
         "warnings": warnings,
