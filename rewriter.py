@@ -21,7 +21,7 @@ forwarding_domain = os.environ.get("FORWARDING_DOMAIN", "myaddr.com")
 local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
 rewrite_domains = os.environ.get("REWRITE_DOMAINS", "map[mydomain.com:dmarc.mydomain.com]")
 ignore_list = os.environ.get("IGNORELIST", "alldanes@lists.sys.slush.ca")
-ignore_list = ignore_list.split(',')
+ignore_list = {x.strip().lower() for x in ignore_list.split(',') if x.strip()}
 mailman_sasl_user = os.environ.get("MAILMAN_SASL_USER", "mailman@ietf.org").lower()
 
 _policy_cache = ExpiringDict(max_len=50000, max_age_seconds=1800)
@@ -91,7 +91,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
                     except BrokenPipeError as e:
                         logging.debug(f"Client timeout: {e}")
             except psycopg.OperationalError:
-                self.send_response(400)
+                self.send_response(503)
                 # Set the response headers
                 self.send_header("Content-type", "text/plain")
                 self.end_headers()
@@ -137,7 +137,7 @@ def test_local_list(email_addr):
         return len(result) > 0
 
 def test_virtual_alias(email_addr):
-    should_ignore = list(set(ignore_list) & set(email_addr))
+    should_ignore = ignore_list & set(email_addr)
     if not should_ignore:
         with get_db_pool().connection() as conn, conn.cursor() as cur:
             cur.execute("SELECT email from virtual where email = ANY(%s)", [email_addr])
@@ -212,7 +212,7 @@ def update_addr_wrap_log(email_addr, new_email_addr):
     """
     try:
         with get_db_pool().connection() as conn, conn.cursor() as cur:
-            cur.execute(update_addr_wrap_log, (new_email_addr, email_addr,))
+            cur.execute(update_addr_wrap_log, (new_email_addr.lower(), email_addr.lower(),))
     except psycopg.OperationalError as e:
         logging.info(f"failed to update addr_wrap_log: {e}")
     return True
@@ -281,8 +281,8 @@ class EnvelopeMilter(Milter.Base):
             list_fanout = auth_user == mailman_sasl_user and bool(listbounce_mailmatch.search(env_from_addr))
 
             # scenario 1
-            if any((match := wrapped_mailmatch.search(item)) for item in self.mail_to):
-                for addr in self.mail_to:
+            if any(wrapped_mailmatch.search(item) for item in self.mail_to):
+                for i, addr in enumerate(self.mail_to):
                     if wrapped_mailmatch.search(addr):
                         unwrapped_addr = addr.rsplit('@', 1)[0].replace('=40', '@')
                         try:
@@ -308,9 +308,13 @@ class EnvelopeMilter(Milter.Base):
                         if len(valid_unwraps) > 0:
                             self.delrcpt(addr)
                             self.addrcpt(f"<{unwrapped_addr}>")
-                            self.mail_to[self.mail_to.index(addr)] = unwrapped_addr
+                            self.mail_to[i] = unwrapped_addr
+
                         else:
-                            logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {addr}")
+                            logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {addr}, unwrapping regardless")
+                            self.delrcpt(addr)
+                            self.addrcpt(f"<{unwrapped_addr}>")
+                            self.mail_to[i] = unwrapped_addr
                 if not list_fanout:
                     return Milter.ACCEPT
 
@@ -330,7 +334,6 @@ class EnvelopeMilter(Milter.Base):
                 logging.debug(
                     f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
                 )
-                forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
                 if check_dmarc(hdr_from_addr):
                     new_hdr_from_addr = re.sub('@[^@]+$', f'=40{hdr_from_addr.rsplit('@')[-1]}@{forwarding_domain}', hdr_from_addr)
                     update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
@@ -370,7 +373,7 @@ class EnvelopeMilter(Milter.Base):
                 except KeyError:
                     rewrite_domain = forwarding_domain
                 logging.info(f"rewrite domain is {rewrite_domain}")
-                if  len(list(set(ignore_list) & set(self.mail_to))):
+                if ignore_list & set(self.mail_to):
                     logging.info(
                         f"{queue_id} none: Envelope To {self.mail_to} contains an ignore list entry"
                     )
