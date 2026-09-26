@@ -156,6 +156,14 @@ def test_virtual_alias(email_addr):
     else:
         return False
 
+def _dns_temporary_failure(status):
+    # a timeout ("... timed out", or "The resolution lifetime expired ..."
+    # when the overall lifetime runs out) or a SERVFAIL ("All nameservers
+    # failed to answer the query ...: Server ... answered SERVFAIL") says
+    # nothing about the domain's policy, so it must not be cached
+    error = (status.get("error") or "").lower()
+    return any(s in error for s in ("timed out", "lifetime expired", "servfail"))
+
 def _check_dmarc_uncached(domain):
     matches = ["reject", "quarantine"]
     dmarc_status = checkdmarc.check_dmarc(domain, timeout=1.0, timeout_retries=2)
@@ -166,7 +174,7 @@ def _check_dmarc_uncached(domain):
         location = (dmarc_status.get("location") or domain).rstrip(".").lower()
         tag = "p" if location == domain else "sp"
         return dmarc_status["tags"][tag]["value"] in matches
-    if "timed out" in dmarc_status.get("error", "").lower():
+    if _dns_temporary_failure(dmarc_status):
         return None
     return False
 
@@ -176,7 +184,7 @@ def _check_spf_uncached(domain):
     logging.debug(f"spf status is {spf_status}")
     if "parsed" in spf_status:
         return any(x in spf_status["parsed"]["all"] for x in matches)
-    if "timed out" in spf_status.get("error", "").lower():
+    if _dns_temporary_failure(spf_status):
         return None
     return False
 
