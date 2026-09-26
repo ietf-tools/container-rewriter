@@ -9,11 +9,17 @@ recipient changes and database writes.
   # one sender, one destination
   ./harness.py --from 'Alice <alice@yahoo.com>' --to bob@example.com
 
-  # several destinations: treated as a mailman fan-out of --list
-  ./harness.py --from alice@yahoo.com --to a@example.com b@example.net c@example.org
+  # several destinations in one message
+  ./harness.py --from alice@yahoo.com --to a@example.com b@example.net
+
+  # a mailman fan-out of --list (only when --list is given)
+  ./harness.py --from alice@yahoo.com --list ietf@ietf.org --to a@example.com b@example.net c@example.org
 
   # set the envelope sender (MAIL FROM) separately from the From header
   ./harness.py --from alice@yahoo.com --env-from bounces@mailer.yahoo.com --to bob@example.com
+
+  # a recipient on the ignore list (overrides IGNORELIST; repeatable)
+  ./harness.py --from alice@yahoo.com --to alldanes@lists.sys.slush.ca --ignore alldanes@lists.sys.slush.ca
 
   # a bounce coming back to a wrapped list address
   ./harness.py --from MAILER-DAEMON@example.com --to ietf-bounces=40ietf.org@dmarc.ietf.org
@@ -45,6 +51,9 @@ DEFAULT_ENV = {
 }
 
 QUEUE_ID = "HARNESS01"
+
+# always present in mailman_lists, so test_local_list() matches them
+DEFAULT_LOCAL_LISTS = ("ietf@ietf.org", "testlist@ietf.org")
 
 
 # --- stubs for modules that may not be installed locally --------------------
@@ -410,20 +419,24 @@ def build_parser():
     p.add_argument("--from", dest="source", default="sender@example.com",
                    help="From header, e.g. 'Alice <alice@yahoo.com>' (default: %(default)s)")
     p.add_argument("--to", nargs="+", default=None,
-                   help="destination address(es); more than one means a mailman fan-out "
-                        "(default: the --list address)")
-    p.add_argument("--list", default="ietf@ietf.org",
-                   help="mailing list the fan-out comes from (default: %(default)s)")
-    p.add_argument("--fanout", action="store_true",
-                   help="treat --to as a list fan-out even with one address")
+                   help="destination address(es); required unless --list is given "
+                        "(then defaults to the --list address)")
+    p.add_argument("--list", default=None, metavar="ADDR",
+                   help="treat the message as a mailman fan-out from this list")
     p.add_argument("-f", "--env-from", "--mail-from", dest="env_from", metavar="ADDR",
                    help="envelope sender (MAIL FROM); default: the --from address, or "
                         "<list>-bounces@<domain> for a fan-out. Use '' for the null sender <>")
     p.add_argument("--auth", help="override the SASL user ({auth_authen})")
     p.add_argument("--local-list", action="append", default=[], metavar="ADDR",
-                   help="extra address in mailman_lists (the --list address is always there)")
+                   help="extra address in mailman_lists (the --list address and "
+                        f"{', '.join(DEFAULT_LOCAL_LISTS)} are always there)")
+    p.add_argument("--no-default-lists", action="store_true",
+                   help=f"leave {', '.join(DEFAULT_LOCAL_LISTS)} out of mailman_lists")
     p.add_argument("--virtual", action="append", default=[], metavar="ADDR",
                    help="address present in the virtual table (aliases and valid wraps)")
+    p.add_argument("--ignore", action="append", metavar="ADDR",
+                   help="address on the ignore list; replaces IGNORELIST from the environment "
+                        "(repeatable; --ignore '' for an empty list)")
     p.add_argument("--db-down", action="store_true", help="every database call times out")
     p.add_argument("--dmarc", action="append", metavar="DOMAIN=POLICY", help="pin a DMARC answer")
     p.add_argument("--spf", action="append", metavar="DOMAIN=ALL", help="pin an SPF answer")
@@ -442,6 +455,8 @@ def main(argv=None):
 
     for k, v in DEFAULT_ENV.items():
         os.environ.setdefault(k, v)
+    if args.ignore is not None:
+        os.environ["IGNORELIST"] = ",".join(args.ignore)
     os.environ["LOG_LEVEL"] = "DEBUG" if args.verbose else ("WARNING" if args.quiet else "INFO")
     log_dir = tempfile.mkdtemp(prefix="rewriter-harness-")
     os.environ["LOGGING_FILENAME"] = os.path.join(log_dir, "rewrite.log")
@@ -457,17 +472,24 @@ def main(argv=None):
                               args.no_dns or "checkdmarc" in stubbed)
     rewriter.checkdmarc = fake_dns
 
-    list_addr = args.list.lower()
-    list_local, list_domain = list_addr.rsplit("@", 1)
-    db = FakeDB(lists={list_addr, *(a.lower() for a in args.local_list)},
+    fanout = args.list is not None
+    list_addr = args.list.lower() if fanout else None
+    if fanout:
+        list_local, list_domain = list_addr.rsplit("@", 1)
+    elif not args.to:
+        build_parser().error("--to is required unless --list is given")
+    local_lists = {*(() if args.no_default_lists else DEFAULT_LOCAL_LISTS),
+                   *([list_addr] if fanout else []),
+                   *(a.lower() for a in args.local_list)}
+    db = FakeDB(lists=local_lists,
                 virtual=(a.lower() for a in args.virtual),
                 down=args.db_down)
     rewriter.get_db_pool = lambda: db
+    ignore_list = {a.strip().lower() for a in rewriter.ignore_list if a.strip()}
 
     header_from = args.source
     source_addr = email.utils.parseaddr(header_from)[1]
     recipients = args.to or [list_addr]
-    fanout = args.fanout or len(recipients) > 1
 
     if fanout:
         default_env_from = f"{list_local}-bounces@{list_domain}"
@@ -476,7 +498,7 @@ def main(argv=None):
     else:
         default_env_from = source_addr
         auth = args.auth or ""
-        header_to = recipients[0]
+        header_to = ", ".join(recipients)
     env_from = args.env_from.strip("<>") if args.env_from is not None else default_env_from
 
     ctx = FakeCtx({"i": QUEUE_ID, "{auth_authen}": auth or None})
@@ -584,8 +606,11 @@ def main(argv=None):
         relay_sessions(tx, server, client, auth, final_from, rcpts,
                        apply_header_changes(headers, ctx.actions), body, local_domains)
 
+    ignored = [r for r in recipients if r.lower() in ignore_list]
     report = {
         "mode": "list fan-out" if fanout else "single message",
+        "ignore_list": sorted(ignore_list),
+        "ignored_recipients": ignored,
         "input": {"envelope_from": env_from, "header_from": header_from,
                   "recipients": recipients, "auth_user": auth or None},
         "result": result,
@@ -620,10 +645,11 @@ def main(argv=None):
     print("recipients:")
     for r in recipients:
         mark = " " if r.lower() in rcpts else "-"
-        print(f"  {mark} {r}")
+        print(f"  {mark} {r}" + ("   (on ignore list)" if r in ignored else ""))
     for r in rcpts:
         if r not in (x.lower() for x in recipients):
             print(f"  + {r}")
+    print(f"ignore list:    {', '.join(sorted(ignore_list)) or '(empty)'}")
     if db.writes:
         print("db writes:")
         for w in db.writes:
