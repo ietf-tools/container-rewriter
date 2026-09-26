@@ -20,8 +20,12 @@ forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.
 forwarding_domain = os.environ.get("FORWARDING_DOMAIN", "myaddr.com")
 local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
 rewrite_domains = os.environ.get("REWRITE_DOMAINS", "map[mydomain.com:dmarc.mydomain.com]")
-ignore_list = os.environ.get("IGNORELIST", "alldanes@lists.sys.slush.ca")
-ignore_list = {x.strip().lower() for x in ignore_list.split(',') if x.strip()}
+
+def parse_ignore_list(value):
+    # comma separated; entries are trimmed and matched case-insensitively
+    return {x.strip().lower() for x in value.split(',') if x.strip()}
+
+ignore_list = parse_ignore_list(os.environ.get("IGNORELIST", "alldanes@lists.sys.slush.ca"))
 mailman_sasl_user = os.environ.get("MAILMAN_SASL_USER", "mailman@ietf.org").lower()
 
 _policy_cache = ExpiringDict(max_len=50000, max_age_seconds=1800)
@@ -40,11 +44,16 @@ logging_filename = os.environ.get("LOGGING_FILENAME", "/var/log/rewrite.log")
 logging_rotate_period = os.environ.get("LOGGING_ROTATE_PERIOD", "D")
 logging_format = "{asctime} milter/rewriter[{process}]: {message} [{filename}:{lineno}]"
 
-# matched against the unquoted (internal) form of the address
-wrapped_regex = f"^[^@]+(?<!-bounce)(?<!-bounces)=40[-a-z0-9.]+@{re.escape(forwarding_domain)}$"
+# matched against the unquoted (internal) form of the address, whose local
+# part may itself contain @; the original domain may be UTF-8 (SMTPUTF8)
+# (list bounces are excluded by is_wrapped())
+wrapped_regex = rf"^.+=40[-a-z0-9.\x80-\U0010ffff]+@{re.escape(forwarding_domain)}$"
 wrapped_mailmatch = re.compile(wrapped_regex, re.IGNORECASE)
 
-listbounce_regex = "^[-_.0-9a-z]+-bounces+"
+# Mailman 3 bounce addresses: <list>-bounces@, VERP <list>-bounces+<user>=<domain>@
+# and probes <list>-bounces+<token>@; any of them may also be wrapped by us
+# (<list>-bounces=40<domain>@, <list>-bounces+<user>=<domain>=40<domain>@)
+listbounce_regex = r"^[^@+]+-bounces(?:\+[^@]*|=40[^@]*)?@"
 listbounce_mailmatch = re.compile(listbounce_regex, re.IGNORECASE)
 
 logging.basicConfig(
@@ -239,6 +248,11 @@ def unwrap_addr(addr):
     user, sep, orig_domain = unquote_local(local).rpartition('=40')
     return f"{quote_local(user)}@{orig_domain}" if sep else addr
 
+def is_wrapped(addr):
+    # list bounces are wrapped too, but unwrap_list_bounces() handles those
+    key = internal_addr(addr)
+    return bool(wrapped_mailmatch.search(key)) and not listbounce_mailmatch.search(key)
+
 def check_local(email_addr):
     local_domain_list = local_domains.split(" ")
     domain = email_addr.rsplit("@")[-1].lower()
@@ -338,10 +352,10 @@ class EnvelopeMilter(Milter.Base):
             list_fanout = auth_user == mailman_sasl_user and bool(listbounce_mailmatch.search(env_from_addr))
 
             # scenario 1
-            if any(wrapped_mailmatch.search(internal_addr(item)) for item in self.mail_to):
-                only_wrapped = all(wrapped_mailmatch.search(internal_addr(item)) for item in self.mail_to)
+            if any(is_wrapped(item) for item in self.mail_to):
+                only_wrapped = all(is_wrapped(item) for item in self.mail_to)
                 for i, addr in enumerate(self.mail_to):
-                    if wrapped_mailmatch.search(internal_addr(addr)):
+                    if is_wrapped(addr):
                         unwrapped_addr = unwrap_addr(addr)
                         try:
                             with get_db_pool().connection() as conn, conn.cursor() as cur:
