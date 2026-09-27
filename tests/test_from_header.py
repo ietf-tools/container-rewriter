@@ -82,3 +82,34 @@ def test_no_control_characters(rewriter, name):
 def test_through_milter(run, from_header, expected):
     report = run("--from", from_header, "--to", "bob@other.test", "--dmarc", "example.com=reject")
     assert report["header_from"] == expected
+
+
+# --- X-Original-From ------------------------------------------------------------
+
+def added_headers(report):
+    return [a[1:] for a in report["milter_actions"] if a[0] == "addheader"]
+
+
+@pytest.mark.parametrize("to", [
+    pytest.param(["bob@other.test"], id="fall-through"),
+    pytest.param(["alias@ietf.org", "--virtual", "alias@ietf.org"], id="virtual-alias"),
+])
+@pytest.mark.parametrize("from_header", [
+    "Alice Smith <alice@example.com>",
+    "=?utf-8?q?Jos=C3=A9?= <alice@example.com>",
+])
+def test_original_from_kept(run, to, from_header):
+    report = run("--from", from_header, "--dmarc", "example.com=reject", "--to", *to)
+    assert added_headers(report) == [["X-Original-From", from_header]]
+
+
+@pytest.mark.parametrize("args", [
+    pytest.param(["--to", "bob@other.test"], id="no-dmarc-policy"),
+    pytest.param(["-f", "bounces@mailer.example.net", "--spf", "mailer.example.net=-all",
+                  "--to", "bob@other.test"], id="spf-only"),
+    pytest.param(["--dmarc", "example.com=reject", "--to", "ietf@ietf.org"], id="local-list"),
+    pytest.param(["--to", "alice=40example.com@dmarc.ietf.org"], id="unwrap"),
+])
+def test_no_original_from_without_rewrite(run, args):
+    report = run("--from", "alice@example.com", *args)
+    assert added_headers(report) == []

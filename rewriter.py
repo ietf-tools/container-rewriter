@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 import email.errors
 import email.utils
-from email.header import Header, decode_header, make_header
-
-from expiringdict import ExpiringDict
 import logging
 import os
 import re
 import threading
+from email.header import Header, decode_header, make_header
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import TimedRotatingFileHandler
 
 import checkdmarc
 import Milter
 import psycopg
+from expiringdict import ExpiringDict
 from psycopg_pool import ConnectionPool
 
 forwarding_addr = os.environ.get("FORWARDING_ADDR", "forwardingalgorithm@myaddr.com")
@@ -256,6 +255,36 @@ def unwrap_addr(addr):
     user, sep, orig_domain = unquote_local(local).rpartition('=40')
     return f"{quote_local(user)}@{orig_domain}" if sep else addr
 
+def unwrap_header_addrs(value):
+    # an address-list header (To:, Cc:) with our wrapped addresses unwrapped,
+    # or None if it has none; display names are kept
+    pairs = [(name, addr) for name, addr in email.utils.getaddresses([value]) if addr]
+    if not any(is_wrapped(addr) for _name, addr in pairs):
+        return None
+    addrs = [format_from_header(name, unwrap_addr(addr) if is_wrapped(addr) else addr)
+             for name, addr in pairs]
+    # RFC 5322 2.1.1: fold between addresses to keep lines short
+    lines = [addrs[0]]
+    for addr in addrs[1:]:
+        if len(lines[-1]) + len(addr) + 2 > 76:
+            lines.append(addr)
+        else:
+            lines[-1] += ", " + addr
+    return ",\n\t".join(lines)
+
+def valid_wraps(addrs):
+    # the wrapped addresses we handed out in the last 30 days.  Recipients
+    # added with addrcpt() skip Postfix's RCPT checks, so only these may be
+    # delivered to, or a Cc: list would turn us into an open relay
+    if not addrs:
+        return set()
+    with get_db_pool().connection() as conn, conn.cursor() as cur:
+        cur.execute("""
+                    SELECT email FROM virtual
+                    WHERE email = ANY(%s) AND updated >= NOW() - INTERVAL '30 DAYS';
+                    """, ([internal_addr(a) for a in addrs],))
+        return {row[0] for row in cur.fetchall()}
+
 def is_wrapped(addr):
     # list bounces are wrapped too, but unwrap_list_bounces() handles those
     key = internal_addr(addr)
@@ -287,12 +316,14 @@ class EnvelopeMilter(Milter.Base):
         self.mail_from = None
         self.header_from = None
         self.header_to = None
+        self.addr_headers = []
 
     def envfrom(self, f, *str):
         # one milter instance serves every message on an SMTP connection
         self.mail_to = []
         self.header_from = None
         self.header_to = None
+        self.addr_headers = []
         # addresses keep their case: local parts (SRS, VERP) can be case
         # sensitive and delrcpt() must name the recipient exactly as given;
         # internal_addr() gives the lowercased form for comparisons
@@ -312,6 +343,8 @@ class EnvelopeMilter(Milter.Base):
             self.header_from = value
         if name.lower() == "to":
             self.header_to = value
+        if name.lower() in ("to", "cc"):
+            self.addr_headers.append((name, value))
         return Milter.CONTINUE
 
     def change_env_from(self, env_from_addr, new_addr, queue_id):
@@ -322,6 +355,11 @@ class EnvelopeMilter(Milter.Base):
             return env_from_addr
         self.chgfrom(new_addr)
         return new_addr
+
+    def change_header_from(self, name, new_addr):
+        # keep the original From, as postconfirm did, so it isn't lost
+        self.chgheader("From", 0, format_from_header(name, new_addr))
+        self.addheader("X-Original-From", self.header_from)
 
     def unwrap_list_bounces(self, queue_id):
         # a -bounces recipient in a rewrite domain was wrapped by us on the
@@ -338,6 +376,71 @@ class EnvelopeMilter(Milter.Base):
             self.delrcpt(addr)
             self.addrcpt(f"<{unwrapped_addr}>")
             self.mail_to[i] = unwrapped_addr
+
+    def unwrap_from_headers(self, queue_id):
+        # as postconfirm's dmarc-reverse: deliver to the wrapped addresses
+        # named in To:/Cc:, not to the envelope, and restore them there
+        header_addrs = [addr for _field, value in self.addr_headers
+                        for _name, addr in email.utils.getaddresses([value])
+                        if addr and is_wrapped(addr)]
+        valid = valid_wraps(header_addrs)
+        keep = [a for a in self.mail_to if not is_wrapped(a)]
+        seen = {internal_addr(a) for a in keep}
+        added = []
+        for addr in header_addrs:
+            if internal_addr(addr) not in valid:
+                logging.info(f"{queue_id} unwrap: {addr} has no current wrap record, not delivered [{self.id}]")
+                continue
+            unwrapped = unwrap_addr(addr)
+            if internal_addr(unwrapped) in seen:
+                continue
+            seen.add(internal_addr(unwrapped))
+            added.append(unwrapped)
+
+        # delrcpt() must name the recipient exactly as it was given
+        for addr in self.mail_to:
+            if is_wrapped(addr):
+                self.delrcpt(addr)
+                logging.info(f"{queue_id} unwrap: envelope recipient {addr} replaced by header recipients [{self.id}]")
+        for addr in added:
+            self.addrcpt(f"<{addr}>")
+            logging.info(f"{queue_id} unwrap: recipient {addr} added from headers [{self.id}]")
+        self.mail_to = keep + added
+
+        # chgheader() counts from 1 among headers of the same name
+        counts = {}
+        for name, value in self.addr_headers:
+            idx = counts[name.lower()] = counts.get(name.lower(), 0) + 1
+            new_value = unwrap_header_addrs(value)
+            if new_value is not None:
+                self.chgheader(name, idx, new_value)
+                logging.info(f"{queue_id} unwrap: header-{name} changed from {value} to {new_value} [{self.id}]")
+
+    def rewrite_forwarded(self, hdr_from_name, hdr_from_addr, env_from_addr, queue_id):
+        # a message we pass on from someone else's domain (alias forward,
+        # reply to a wrapped address): take over a p=reject/quarantine From,
+        # or just the envelope when only SPF would fail
+        if check_dmarc(hdr_from_addr):
+            new_hdr_from_addr = wrap_addr(hdr_from_addr, forwarding_domain)
+            # nobody replies to a bounce, so no wrap entry for it
+            if env_from_addr:
+                update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
+            new_env_from = self.change_env_from(env_from_addr, forwarding_addr, queue_id)
+            self.change_header_from(hdr_from_name, new_hdr_from_addr)
+            logging.info(
+                f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr or '<>'} to {new_env_from or '<>'}, header-from changed {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
+            )
+        # SPF is checked on the MAIL FROM domain; we already send for
+        # our local domains, so forwarding can't break theirs
+        elif env_from_addr and not check_local(env_from_addr) and check_spf(env_from_addr):
+            logging.info(
+                f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: {env_from_addr or '<>'} [{self.id}]"
+            )
+            self.change_env_from(env_from_addr, forwarding_addr, queue_id)
+        else:
+            logging.info(
+                f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} [{self.id}]"
+            )
 
     def eom(self):
         queue_id = None
@@ -362,42 +465,22 @@ class EnvelopeMilter(Milter.Base):
             # scenario 1
             if any(is_wrapped(item) for item in self.mail_to):
                 only_wrapped = all(is_wrapped(item) for item in self.mail_to)
-                for i, addr in enumerate(self.mail_to):
-                    if is_wrapped(addr):
-                        unwrapped_addr = unwrap_addr(addr)
-                        try:
-                            with get_db_pool().connection() as conn, conn.cursor() as cur:
-                                cur.execute("""
-                                            SELECT email FROM
-                                            virtual WHERE email = %s and
-                                            updated >= NOW() - INTERVAL '30 DAYS';
-                                            """, (internal_addr(addr),))
-                                valid_unwraps = cur.fetchall()
-                        except psycopg.OperationalError as e:
-                            logging.info(f"failed to find valid rewrite: {e}")
-                            valid_unwraps = []
-                        except psycopg.ProgrammingError as e:
-                            logging.info(f"failed to find valid rewrite: {e}")
-                            valid_unwraps = []
-                        logging.debug(
-                            f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
-                        )
-                        logging.info(
-                            f"{queue_id} unwrap: from {addr} to {unwrapped_addr} [{self.id}]"
-                        )
-                        if len(valid_unwraps) > 0:
-                            self.delrcpt(addr)
-                            self.addrcpt(f"<{unwrapped_addr}>")
-                            self.mail_to[i] = unwrapped_addr
-
-                        else:
-                            logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {addr}, unwrapping regardless")
-                            self.delrcpt(addr)
-                            self.addrcpt(f"<{unwrapped_addr}>")
-                            self.mail_to[i] = unwrapped_addr
+                logging.debug(
+                    f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
+                )
+                self.unwrap_from_headers(queue_id)
+                if not self.mail_to:
+                    # e.g. only Bcc'd, or no current wrap record: nothing to
+                    # deliver, as postconfirm's pipe would have failed too
+                    logging.info(f"{queue_id} reject: no valid recipients after unwrapping [{self.id}]")
+                    self.setreply("550", "5.1.1", "no valid recipients")
+                    return Milter.REJECT
                 # other recipients (e.g. a virtual alias on CC) still need
                 # the checks below
                 if only_wrapped and not list_fanout:
+                    # we forward the reply from our IPs, so the replier's SPF
+                    # fails and their DKIM rarely survives the To:/Cc: rewrite
+                    self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
                     return Milter.ACCEPT
 
             if list_fanout:
@@ -418,31 +501,7 @@ class EnvelopeMilter(Milter.Base):
                 logging.debug(
                     f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
                 )
-                if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = wrap_addr(hdr_from_addr, forwarding_domain)
-                    # nobody replies to a bounce, so no wrap entry for it
-                    if env_from_addr:
-                        update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
-                    new_env_from = self.change_env_from(env_from_addr, forwarding_addr, queue_id)
-                    self.chgheader(
-                        "From",
-                        0,
-                        format_from_header(_hdr_from_name, new_hdr_from_addr),
-                    )
-                    logging.info(
-                        f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr or '<>'} to {new_env_from or '<>'}, header-from changed {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
-                    )
-                # SPF is checked on the MAIL FROM domain; we already send for
-                # our local domains, so forwarding can't break theirs
-                elif env_from_addr and not check_local(env_from_addr) and check_spf(env_from_addr):
-                    logging.info(
-                        f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: {env_from_addr or '<>'} [{self.id}]"
-                    )
-                    self.change_env_from(env_from_addr, forwarding_addr, queue_id)
-                else:
-                    logging.info(
-                        f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} [{self.id}]"
-                    )
+                self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
                 return Milter.ACCEPT
             # scenario 3
             if check_local(env_from_addr) and check_local(hdr_from_addr):
@@ -469,11 +528,7 @@ class EnvelopeMilter(Milter.Base):
                     return Milter.ACCEPT
                 if check_dmarc(hdr_from_addr):
                     new_hdr_from_addr = wrap_addr(hdr_from_addr, forwarding_domain)
-                    self.chgheader(
-                        "From",
-                        0,
-                        format_from_header(_hdr_from_name, new_hdr_from_addr),
-                    )
+                    self.change_header_from(_hdr_from_name, new_hdr_from_addr)
                     # nobody replies to a bounce, so no wrap entry for it
                     if env_from_addr:
                         update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)

@@ -22,7 +22,7 @@ MAILMAN_SENDERS = [
 
 def reply_lookups(report):
     # the lookup scenario 1 makes before unwrapping a reply
-    return [q for q in report["db_queries"] if "email = %s" in q]
+    return [q for q in report["db_queries"] if "from virtual" in q and "updated" in q]
 
 
 @pytest.mark.parametrize("addr", [

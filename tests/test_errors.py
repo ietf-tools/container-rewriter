@@ -29,26 +29,28 @@ def test_db_down_tempfails(run):
     assert report["reply"] == "451 4.3.0 backend unavailable"
 
 
-def test_db_down_unwrap_still_unwraps(run):
-    # the wrap lookup fails, and the recipient is unwrapped regardless
+def test_db_down_unwrap_tempfails(run):
+    # without the wrap lookup a reply can't be checked, so it waits rather
+    # than being unwrapped to whatever the headers name
     wrapped = f"carol=40other.test@{FWD}"
     report = run("--db-down", "--from", "bob@y.test", "--to", wrapped)
-    assert report["result"] == "ACCEPT"
-    assert report["recipients"] == ["carol@other.test"]
+    assert report["result"] == "TEMPFAIL"
+    assert report["reply"] == "451 4.3.0 backend unavailable"
 
 
 def test_unwrap_lookup_programming_error(run, rewriter, monkeypatch):
     import psycopg
-    raise_on(monkeypatch, "email = %s", psycopg.ProgrammingError("relation does not exist"))
+    raise_on(monkeypatch, "updated >=", psycopg.ProgrammingError("relation does not exist"))
     wrapped = f"carol=40other.test@{FWD}"
     report = run("--from", "bob@y.test", "--to", wrapped, "--virtual", wrapped)
-    assert report["result"] == "ACCEPT"
-    assert report["recipients"] == ["carol@other.test"]
+    assert report["result"] == "TEMPFAIL"
+    assert report["reply"] == "451 4.3.0 rewriter internal error"
 
 
 def test_unwrap_without_wrap_record(run):
     report = run("--from", "bob@y.test", "--to", f"carol=40other.test@{FWD}")
-    assert report["recipients"] == ["carol@other.test"]
+    assert report["result"] == "REJECT"
+    assert report["reply"] == "550 5.1.1 no valid recipients"
 
 
 def test_wrap_log_write_failure_is_not_fatal(run, monkeypatch):
@@ -94,7 +96,7 @@ def test_exception_after_changes_tempfails(run, rewriter, monkeypatch):
     report = run("--from", SENDER, *REJECT, "--to", "bob@other.test")
     assert report["result"] == "TEMPFAIL"
     assert report["reply"] == "451 4.3.0 rewriter internal error"
-    assert [a[0] for a in report["milter_actions"]] == ["chgheader"]
+    assert [a[0] for a in report["milter_actions"]] == ["chgheader", "addheader"]
 
 
 # --- chgfrom failures -------------------------------------------------------------

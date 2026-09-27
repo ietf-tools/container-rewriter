@@ -171,6 +171,188 @@ def test_round_trip(run, original, wrapped, key, unwrapped):
     assert back["recipients"] == [unwrapped]
 
 
+# --- replies delivered to the wrapped addresses in To: and Cc: --------------------
+
+def header_values(report, name):
+    return [v for k, v in report["headers"] if k.lower() == name.lower()]
+
+
+@pytest.mark.parametrize("value, expected", [
+    pytest.param(f"alice=40example.com@{FWD}", "alice@example.com", id="bare"),
+    pytest.param(f"Alice Smith <alice=40example.com@{FWD}>",
+                 "Alice Smith <alice@example.com>", id="display-name"),
+    pytest.param(f'"Smith, Alice" <alice=40example.com@{FWD}>, carol@elsewhere.test',
+                 '"Smith, Alice" <alice@example.com>, carol@elsewhere.test', id="with-other"),
+    pytest.param(f"=?utf-8?q?Jos=C3=A9?= <jose=40example.com@{FWD}>",
+                 "=?utf-8?b?Sm9zw6k=?= <jose@example.com>", id="encoded-name"),
+    pytest.param(f"a=40x.test@{FWD},\r\n\tb=40y.test@{FWD}", "a@x.test, b@y.test", id="folded-input"),
+    pytest.param(", ".join(f"user{i}=40example.com@{FWD}" for i in range(6)),
+                 "user0@example.com, user1@example.com, user2@example.com, user3@example.com,\n\t"
+                 "user4@example.com, user5@example.com", id="long-is-folded"),
+    pytest.param("carol@elsewhere.test, dave@other.test", None, id="none-wrapped"),
+    pytest.param("undisclosed-recipients:;", None, id="empty-group"),
+])
+def test_unwrap_header_addrs(rewriter, value, expected):
+    assert rewriter.unwrap_header_addrs(value) == expected
+
+
+@pytest.mark.parametrize("original, wrapped, key, unwrapped", CASES)
+def test_reply_unwraps_to_header(run, original, wrapped, key, unwrapped):
+    report = run("--from", SENDER, "--to", wrapped, "--virtual", key)
+    assert header_values(report, "To") == [unwrapped]
+
+
+def test_cc_recipients_come_from_headers(run):
+    """Wrapped addresses in Cc: are delivered to, even with only one wrapped
+    envelope recipient."""
+    report = run("--from", SENDER, "--to", f"alice=40example.com@{FWD}",
+                 "--header", f"Cc: Bob <bob=40other.test@{FWD}>, carol@elsewhere.test",
+                 "--virtual", f"alice=40example.com@{FWD}", "--virtual", f"bob=40other.test@{FWD}")
+    assert report["result"] == "ACCEPT"
+    assert sorted(report["recipients"]) == ["alice@example.com", "bob@other.test"]
+    assert header_values(report, "To") == ["alice@example.com"]
+    assert header_values(report, "Cc") == ["Bob <bob@other.test>, carol@elsewhere.test"]
+
+
+def test_unknown_wraps_in_headers_not_delivered(run):
+    """Only wraps we handed out may be delivered to; the rest are only shown
+    unwrapped in the headers."""
+    report = run("--from", SENDER, "--to", f"alice=40example.com@{FWD}",
+                 "--header", f"Cc: mallory=40evil.test@{FWD}",
+                 "--virtual", f"alice=40example.com@{FWD}")
+    assert report["recipients"] == ["alice@example.com"]
+    assert header_values(report, "Cc") == ["mallory@evil.test"]
+
+
+def test_bcc_wrapped_recipient_dropped(run):
+    """As with postconfirm, a wrapped address only in the envelope gets nothing."""
+    report = run("--from", SENDER, "--to", f"alice=40example.com@{FWD}",
+                 "--bcc", f"bcc=40example.org@{FWD}",
+                 "--virtual", f"alice=40example.com@{FWD}", "--virtual", f"bcc=40example.org@{FWD}")
+    assert report["result"] == "ACCEPT"
+    assert report["recipients"] == ["alice@example.com"]
+    assert report["warnings"] == []
+
+
+def test_no_valid_recipients_rejected(run):
+    """The To: address has no wrap record and the valid one is only Bcc'd,
+    so nothing is left to deliver to."""
+    report = run("--from", SENDER, "--to", f"nobody=40example.com@{FWD}",
+                 "--bcc", f"bcc=40example.org@{FWD}", "--virtual", f"bcc=40example.org@{FWD}")
+    assert report["result"] == "REJECT"
+    assert report["reply"] == "550 5.1.1 no valid recipients"
+
+
+def test_duplicate_addresses_delivered_once(run):
+    report = run("--from", SENDER, "--to", f"alice=40example.com@{FWD}",
+                 "--header", f"Cc: ALICE=40EXAMPLE.COM@{FWD}, Alice <alice=40example.com@{FWD}>",
+                 "--virtual", f"alice=40example.com@{FWD}")
+    assert report["recipients"] == ["alice@example.com"]
+
+
+def test_original_also_on_envelope_delivered_once(run):
+    report = run("--from", SENDER, "--to", f"alice=40example.com@{FWD}", "alice@example.com",
+                 "--virtual", f"alice=40example.com@{FWD}")
+    assert report["recipients"] == ["alice@example.com"]
+
+
+def test_every_to_and_cc_header_is_rewritten(run):
+    report = run("--from", SENDER, "--to", f"alice=40example.com@{FWD}",
+                 "--header", f"Cc: Bob <bob=40other.test@{FWD}>",
+                 "--header", "Cc: carol@elsewhere.test",
+                 "--header", f"Cc: dave=40example.net@{FWD}",
+                 "--virtual", f"alice=40example.com@{FWD}")
+    assert header_values(report, "Cc") == ["Bob <bob@other.test>", "carol@elsewhere.test",
+                                           "dave@example.net"]
+    assert [a[:3] for a in report["milter_actions"] if a[0] == "chgheader"] == [
+        ["chgheader", "To", 1], ["chgheader", "Cc", 1], ["chgheader", "Cc", 3]]
+
+
+def test_reply_all_to_list_keeps_list(run):
+    report = run("--from", SENDER, "--to", "ietf@ietf.org", f"alice=40example.com@{FWD}",
+                 "--virtual", f"alice=40example.com@{FWD}")
+    assert report["result"] == "ACCEPT"
+    assert report["recipients"] == ["ietf@ietf.org", "alice@example.com"]
+    assert header_values(report, "To") == ["ietf@ietf.org, alice@example.com"]
+
+
+def test_headers_untouched_without_wrapped_recipient(run):
+    """Only a message to a wrapped envelope recipient has its headers unwrapped."""
+    report = run("--from", SENDER, "--to", "carol@elsewhere.test",
+                 "--header", f"Cc: alice=40example.com@{FWD}")
+    assert header_values(report, "Cc") == [f"alice=40example.com@{FWD}"]
+    assert report["recipients"] == ["carol@elsewhere.test"]
+    assert not [a for a in report["milter_actions"] if a[0] == "chgheader"]
+
+
+# --- replies are DMARC-rewritten like any other forwarded message -----------------
+
+ALICE = f"alice=40example.com@{FWD}"
+FORWARDING_ADDR = f"forwardingalgorithm@{FWD}"
+
+
+def test_reply_from_reject_domain_is_rewritten(run):
+    report = run("--from", "Bob <bob@yahoo.test>", "--dmarc", "yahoo.test=reject",
+                 "--to", ALICE, "--virtual", ALICE)
+    assert report["result"] == "ACCEPT"
+    assert report["recipients"] == ["alice@example.com"]
+    assert report["header_from"] == f"Bob <bob=40yahoo.test@{FWD}>"
+    assert report["envelope_from"] == FORWARDING_ADDR
+    assert ["addheader", "X-Original-From", "Bob <bob@yahoo.test>"] in report["milter_actions"]
+    # so that alice can reply back through the wrap
+    assert report["db_writes"] == [{"table": "virtual", "email": f"bob=40yahoo.test@{FWD}",
+                                    "destination": "bob@yahoo.test"}]
+
+
+def test_reply_round_trip(run):
+    """Bob replies to alice's wrap, then alice replies to bob's."""
+    bob = run("--from", "bob@yahoo.test", "--dmarc", "yahoo.test=reject",
+              "--to", ALICE, "--virtual", ALICE)
+    bob_wrapped = email.utils.parseaddr(bob["header_from"])[1]
+    alice = run("--from", "alice@example.com", "--dmarc", "example.com=reject",
+                "--to", bob_wrapped, "--virtual", bob["db_writes"][0]["email"])
+    assert alice["recipients"] == ["bob@yahoo.test"]
+    assert alice["header_from"] == ALICE
+
+
+def test_reply_from_no_policy_domain_untouched(run):
+    report = run("--from", SENDER, "--to", ALICE, "--virtual", ALICE)
+    assert report["header_from"] == SENDER
+    assert report["envelope_from"] == SENDER
+    assert report["db_writes"] == []
+
+
+def test_reply_spf_only_rewrites_envelope(run):
+    report = run("-f", "bounces@mailer.example.net", "--from", SENDER,
+                 "--spf", "mailer.example.net=-all", "--to", ALICE, "--virtual", ALICE)
+    assert report["header_from"] == SENDER
+    assert report["envelope_from"] == FORWARDING_ADDR
+
+
+def test_reply_from_local_sender_untouched(run):
+    report = run("--from", "staff@ietf.org", "--to", ALICE, "--virtual", ALICE)
+    assert report["header_from"] == "staff@ietf.org"
+    assert report["envelope_from"] == "staff@ietf.org"
+
+
+def test_bounce_to_wrapped_address(run):
+    """A DSN keeps its null sender and gets no wrap record."""
+    report = run("-f", "", "--from", "MAILER-DAEMON@yahoo.test", "--dmarc", "yahoo.test=reject",
+                 "--to", ALICE, "--virtual", ALICE)
+    assert report["header_from"] == f"MAILER-DAEMON=40yahoo.test@{FWD}"
+    assert report["envelope_from"] == ""
+    assert report["db_writes"] == []
+
+
+def test_reply_all_to_list_leaves_from_alone(run):
+    """The list's copy shares the transaction, and mailman must see the real
+    poster, so the From is not rewritten even for a p=reject replier."""
+    report = run("--from", "bob@yahoo.test", "--dmarc", "yahoo.test=reject",
+                 "--to", "ietf@ietf.org", ALICE, "--virtual", ALICE)
+    assert report["recipients"] == ["ietf@ietf.org", "alice@example.com"]
+    assert report["header_from"] == "bob@yahoo.test"
+
+
 # --- recipients that look wrapped but aren't ------------------------------------
 
 @pytest.mark.parametrize("rcpt", [
