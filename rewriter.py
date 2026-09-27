@@ -121,21 +121,26 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
 
 
 _db_pool = None
+_db_pool_lock = threading.Lock()
 def get_db_pool() -> ConnectionPool:
+    # each milter connection runs in its own thread; without the lock two
+    # first messages could each build a pool, and one would leak
     global _db_pool
     if _db_pool is None:
-        _db_pool = ConnectionPool(
-            kwargs={
-                "dbname": os.getenv("DB_NAME", "postfix"),
-                "host": os.getenv("DB_HOST", "localhost"),
-                "user": os.getenv("DB_USER", "postgres"),
-                "password": os.getenv("DB_PASSWORD", "postgres"),
-                "port": os.getenv("DB_PORT", "5432"),
-            },
-            check=ConnectionPool.check_connection,
-            open=True,
-            timeout=5,
-        )
+        with _db_pool_lock:
+            if _db_pool is None:
+                _db_pool = ConnectionPool(
+                    kwargs={
+                        "dbname": os.getenv("DB_NAME", "postfix"),
+                        "host": os.getenv("DB_HOST", "localhost"),
+                        "user": os.getenv("DB_USER", "postgres"),
+                        "password": os.getenv("DB_PASSWORD", "postgres"),
+                        "port": os.getenv("DB_PORT", "5432"),
+                    },
+                    check=ConnectionPool.check_connection,
+                    open=True,
+                    timeout=5,
+                )
     return _db_pool
 
 
@@ -375,6 +380,13 @@ class EnvelopeMilter(Milter.Base):
         self.chgfrom(new_addr)
         return new_addr
 
+    def log_envelope_wrap(self, env_from_addr, new_env_from):
+        # bounces come back to the wrapped envelope sender, and envrcpt()
+        # only accepts wraps it has a record for.  A null sender stays
+        # null, and unwrap_list_bounces() restores a wrapped list bounce
+        if new_env_from != env_from_addr and is_wrapped(new_env_from):
+            update_addr_wrap_log(env_from_addr, new_env_from)
+
     def change_header_from(self, name, new_addr):
         # keep the original From, as postconfirm did, so it isn't lost
         self.chgheader("From", 0, format_from_header(name, new_addr))
@@ -549,6 +561,8 @@ class EnvelopeMilter(Milter.Base):
                     if env_from_addr:
                         update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
                     new_env_from = self.change_env_from(env_from_addr, wrap_addr(env_from_addr, rewrite_domain), queue_id)
+                    if internal_addr(new_env_from) != internal_addr(new_hdr_from_addr):
+                        self.log_envelope_wrap(env_from_addr, new_env_from)
                     logging.info(
                         f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr or '<>'} to {new_env_from or '<>'} header-From changed from {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
                     )
@@ -559,9 +573,11 @@ class EnvelopeMilter(Milter.Base):
                         f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: {env_from_addr or '<>'} [{self.id}]"
                     )
                     try:
-                        self.change_env_from(env_from_addr, wrap_addr(env_from_addr, rewrite_domain), queue_id)
+                        new_env_from = self.change_env_from(env_from_addr, wrap_addr(env_from_addr, rewrite_domain), queue_id)
                     except Exception as e:
                         logging.info(f"{queue_id} error: chgfrom failed: {e} [{self.id}]")
+                    else:
+                        self.log_envelope_wrap(env_from_addr, new_env_from)
                     return Milter.ACCEPT
                 else:
                     logging.info(

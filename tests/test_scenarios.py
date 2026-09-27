@@ -138,3 +138,61 @@ def test_fall_through_spf_softfail(run):
 def test_dmarc_quarantine_wraps(run):
     report = run("--from", SENDER, "--dmarc", "example.com=quarantine", "--to", "bob@other.test")
     assert report["header_from"] == WRAPPED
+
+
+# --- fall-through: bounces to a wrapped envelope sender -------------------------
+
+VERP = "b-123@mailer.example.net"
+VERP_WRAPPED = f"b-123=40mailer.example.net@{FWD}"
+
+
+def wrap_row(email_addr, destination):
+    return {"table": "virtual", "email": email_addr, "destination": destination}
+
+
+def test_fall_through_spf_only_records_envelope_wrap(run):
+    report = run("-f", VERP, "--from", SENDER,
+                 "--spf", "mailer.example.net=-all", "--to", "bob@other.test")
+    assert report["envelope_from"] == VERP_WRAPPED
+    assert report["db_writes"] == [wrap_row(VERP_WRAPPED, VERP)]
+
+
+def test_fall_through_dmarc_records_both_wraps(run):
+    report = run("-f", VERP, "--from", SENDER, *REJECT, "--to", "bob@other.test")
+    assert report["envelope_from"] == VERP_WRAPPED
+    assert report["header_from"] == WRAPPED
+    assert report["db_writes"] == [wrap_row(WRAPPED, SENDER), wrap_row(VERP_WRAPPED, VERP)]
+
+
+def test_fall_through_same_envelope_and_from_one_row(run):
+    report = run("--from", SENDER, *REJECT, "--to", "bob@other.test")
+    assert report["db_writes"] == [wrap_row(WRAPPED, SENDER)]
+
+
+def test_alias_forward_records_no_envelope_wrap(run):
+    # an alias forward sends from FORWARDING_ADDR, which isn't a wrap
+    report = run("-f", VERP, "--from", SENDER, "--spf", "mailer.example.net=-all", *ALIAS)
+    assert report["envelope_from"] == FORWARDING_ADDR
+    assert report["db_writes"] == []
+
+
+@pytest.mark.parametrize("policy", [
+    pytest.param(("--spf", "mailer.example.net=-all"), id="spf-only"),
+    pytest.param(REJECT, id="dmarc"),
+])
+def test_bounce_to_envelope_wrap_round_trip(run, policy):
+    """A DSN to the wrapped envelope sender goes back to the original one."""
+    out = run("-f", VERP, "--from", SENDER, *policy, "--to", "bob@other.test")
+    virtual = [w["email"] for w in out["db_writes"]]
+
+    back = run("-f", "", "--from", "MAILER-DAEMON@other.test",
+               "--to", out["envelope_from"], *[a for v in virtual for a in ("--virtual", v)])
+    assert back["result"] == "ACCEPT"
+    assert back["recipients"] == [VERP]
+    assert back["envelope_from"] == ""
+
+
+def test_bounce_to_unrecorded_envelope_wrap_refused(run):
+    report = run("-f", "", "--from", "MAILER-DAEMON@other.test", "--to", VERP_WRAPPED)
+    assert report["result"] == "REJECT"
+    assert report["recipients"] == []

@@ -131,7 +131,7 @@ def test_chgfrom_failure_dmarc_tempfails(run, chgfrom_fails):
 def dns(rewriter, monkeypatch):
     """Point rewriter at pinned DNS answers and return the lookup log."""
     def _dns(dmarc=None, spf=None):
-        fake = harness.FakeCheckdmarc(harness._stub_checkdmarc(), dmarc or {}, spf or {}, no_dns=True)
+        fake = harness.LoggedCheckdmarc(harness.FakeDNS(dmarc or {}, spf or {}, no_dns=True))
         monkeypatch.setattr(rewriter, "checkdmarc", fake)
         rewriter._policy_cache.clear()
         return fake.lookups
@@ -199,3 +199,10 @@ def test_timeout_means_no_rewrite(run, rewriter):
     report = run("--from", SENDER, "--dmarc", "example.com=timeout", "--to", "bob@other.test")
     assert report["header_from"] == SENDER
     assert ("dmarc", "example.com") not in rewriter._policy_cache
+
+
+def test_chgfrom_failure_spf_only_records_no_wrap(run, chgfrom_fails):
+    # the envelope was never wrapped, so no bounce can come back to a wrap
+    report = run("-f", "b@mailer.example.net", "--from", SENDER,
+                 "--spf", "mailer.example.net=-all", "--to", "bob@other.test")
+    assert report["db_writes"] == []

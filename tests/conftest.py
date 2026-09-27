@@ -16,11 +16,23 @@ os.environ["LOG_LEVEL"] = "WARNING"
 os.environ["LOGGING_FILENAME"] = os.path.join(tempfile.mkdtemp(prefix="rewriter-tests-"), "rewrite.log")
 
 
+_real = {}
+
+
 @pytest.fixture(scope="session")
 def rewriter():
     harness.install_stubs()
     import rewriter
+    # harness.main() swaps in its fake database for good; keep the real one
+    _real["get_db_pool"] = rewriter.get_db_pool
     return rewriter
+
+
+@pytest.fixture
+def get_db_pool(rewriter, monkeypatch):
+    """The real get_db_pool(), with no pool built yet."""
+    monkeypatch.setattr(rewriter, "_db_pool", None)
+    return _real["get_db_pool"]
 
 
 @pytest.fixture

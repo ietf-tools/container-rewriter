@@ -37,8 +37,9 @@ recipient changes and database writes.
   # a bounce coming back to a wrapped list address
   ./harness.py --from MAILER-DAEMON@example.com --to ietf-bounces=40ietf.org@dmarc.ietf.org
 
-No database is contacted.  DNS lookups are real unless --no-dns is given;
---dmarc/--spf pin a domain's answer either way.  Configuration comes from the
+No database is contacted.  DMARC and SPF are checked by the real checkdmarc;
+--dmarc/--spf pin a domain's DNS records, and other lookups go to live DNS
+unless --no-dns is given.  Configuration comes from the
 usual rewriter environment variables; the defaults below are only used when
 those are unset.
 """
@@ -153,20 +154,10 @@ def _stub_expiringdict():
     return mod
 
 
-def _stub_checkdmarc():
-    mod = types.ModuleType("checkdmarc")
-
-    def unavailable(domain, **kw):
-        return {"error": "checkdmarc not installed (harness stub)"}
-    mod.check_dmarc = mod.check_spf = unavailable
-    return mod
-
-
 def install_stubs():
     stubbed = []
     for name, factory in (("Milter", _stub_milter),
-                          ("expiringdict", _stub_expiringdict),
-                          ("checkdmarc", _stub_checkdmarc)):
+                          ("expiringdict", _stub_expiringdict)):
         try:
             __import__(name)
         except ImportError:
@@ -241,71 +232,156 @@ class FakeCursor:
         return self.rows
 
 
-# --- fake DNS policy ---------------------------------------------------------
+# --- fake DNS ------------------------------------------------------------------
+#
+# rewriter calls the real checkdmarc, which builds a dns.resolver.Resolver for
+# each lookup.  FakeDNS stands in for that resolver, answering from the pinned
+# --dmarc/--spf answers, so checkdmarc's record parsing, DMARCbis tree walk,
+# retries and error messages are the real ones.
 
-DNS_FAILURES = {
-    "timeout": "The resolution lifetime expired after 1.000 seconds: "
-               "Server 192.0.2.1 answered The DNS operation timed out.",
-    "timeout-empty": "The resolution lifetime expired after 1.000 seconds: ",
-    "servfail": "All nameservers failed to answer the query: Server 192.0.2.1 answered SERVFAIL",
-    "nxdomain": "The domain does not exist.",
-}
+DNS_FAILURES = ("timeout", "timeout-empty", "servfail", "nxdomain")
+NAMESERVER = "192.0.2.1"
+
+SPF_QUALIFIERS = {"fail": "-all", "softfail": "~all", "neutral": "?all", "pass": "+all"}
 
 
-SPF_ALL = {"-all": "fail", "~all": "softfail", "?all": "neutral", "+all": "pass", "all": "pass"}
+def dmarc_record(answer):
+    """A pinned DMARC answer ('reject', 'p=none;sp=reject' or a whole record) as TXT."""
+    if answer.lower().startswith("v=dmarc1"):
+        return answer
+    tags = [t.strip() for t in answer.split(";") if t.strip()]
+    return "; ".join(["v=DMARC1", *(t if "=" in t else f"p={t}" for t in tags)])
 
 
-class FakeCheckdmarc:
-    """Proxy for the checkdmarc module that serves pinned answers first."""
+def spf_record(answer):
+    """A pinned SPF answer ('-all', 'softfail' or a whole record) as TXT."""
+    if answer.lower().startswith("v=spf1"):
+        return answer
+    return f"v=spf1 {SPF_QUALIFIERS.get(answer.lower(), answer)}"
 
-    def __init__(self, real, dmarc, spf, no_dns):
-        self.real, self.dmarc, self.spf, self.no_dns = real, dmarc, spf, no_dns
+
+def is_under(name, domain):
+    return name == domain or name.endswith("." + domain)
+
+
+class FakeDNS:
+    """The resolver checkdmarc uses, with pinned zones and no network.
+
+    A --dmarc pin publishes a record at _dmarc.<domain>; a --spf pin publishes
+    a TXT record at <domain>.  Other names at or under a pinned domain exist
+    but have no records, so checkdmarc's tree walk reaches a parent's pin.  A
+    failure pin (timeout, servfail, nxdomain) applies to every such name.
+    Anything else goes to live DNS, or doesn't exist with --no-dns.
+    """
+
+    # checkdmarc sets these on the resolver it builds
+    nameservers = timeout = lifetime = None
+
+    def __init__(self, dmarc, spf, no_dns):
+        self.dmarc, self.spf, self.no_dns = dmarc, spf, no_dns
+        self.queries = []
+        self._real_resolver = None
+        self._live = None
+
+    @contextmanager
+    def installed(self):
+        import dns.resolver
+        real = dns.resolver.Resolver
+        self._real_resolver = real
+        dns.resolver.Resolver = lambda *a, **kw: self
+        try:
+            yield
+        finally:
+            dns.resolver.Resolver = real
+
+    def _answer(self, name, rdtype):
+        """A list of TXT strings (empty: no answer), a failure name, or None for live DNS."""
+        if name.startswith("_dmarc."):
+            target = name[len("_dmarc."):]
+            for domain, answer in self.dmarc.items():
+                if is_under(target, domain):
+                    if answer.lower() in DNS_FAILURES:
+                        return answer.lower()
+                    if target == domain:
+                        return [dmarc_record(answer)] if rdtype == "TXT" else []
+        answer = self.spf.get(name)
+        if answer is not None:
+            if answer.lower() in DNS_FAILURES:
+                return answer.lower()
+            return [spf_record(answer)] if rdtype == "TXT" else []
+        pins = [a.lower() for d, a in (*self.dmarc.items(), *self.spf.items()) if is_under(name, d)]
+        if pins:
+            return "nxdomain" if "nxdomain" in pins else []
+        return "nxdomain" if self.no_dns else None
+
+    def resolve(self, qname, rdtype="A", *args, lifetime=None, **kw):
+        import dns.exception
+        import dns.message
+        import dns.name
+        import dns.rdataclass
+        import dns.rdatatype
+        import dns.resolver
+        from dns.rdtypes.ANY.TXT import TXT
+
+        name = str(qname).rstrip(".").lower()
+        rdtype = dns.rdatatype.to_text(dns.rdatatype.RdataType.make(rdtype))
+        answer = self._answer(name, rdtype)
+        if answer is None:
+            self.queries.append((name, rdtype, "live DNS"))
+            if self._live is None:
+                self._live = self._real_resolver()
+            return self._live.resolve(qname, rdtype, *args, lifetime=lifetime, **kw)
+        self.queries.append((name, rdtype, answer if isinstance(answer, str) else (answer or "no answer")))
+
+        qname = dns.name.from_text(name)
+        lifetime = lifetime or self.lifetime or 1.0
+        if answer == "nxdomain":
+            raise dns.resolver.NXDOMAIN(qnames=[qname], responses={})
+        if answer == "timeout":
+            raise dns.resolver.LifetimeTimeout(
+                timeout=lifetime, errors=[(NAMESERVER, False, 53, dns.exception.Timeout(), None)])
+        if answer == "timeout-empty":
+            raise dns.resolver.LifetimeTimeout(timeout=lifetime, errors=[])
+        if answer == "servfail":
+            raise dns.resolver.NoNameservers(request=dns.message.make_query(qname, rdtype),
+                                             errors=[(NAMESERVER, False, 53, "SERVFAIL", None)])
+        if not answer:
+            raise dns.resolver.NoAnswer()
+        # a TXT string is at most 255 bytes; longer records come in chunks
+        return [TXT(dns.rdataclass.IN, dns.rdatatype.TXT,
+                    [b[i:i + 255] for i in range(0, len(b), 255)])
+                for b in (r.encode() for r in answer)]
+
+
+class LoggedCheckdmarc:
+    """The real checkdmarc, answering from a FakeDNS and logging each check."""
+
+    def __init__(self, fake_dns):
+        import checkdmarc
+        import checkdmarc.utils
+        self.real, self.dns = checkdmarc, fake_dns
         self.lookups = []
+        # checkdmarc keeps its own answers; start each run from a cold cache
+        checkdmarc.utils.DNS_CACHE.clear()
 
-    def _answer(self, kind, domain, pinned, ok, real_fn, kw, walk=False):
-        # walk: like checkdmarc's DMARC tree walk, an unpinned domain takes
-        # the answer pinned on its nearest parent (never a bare TLD)
-        location, value = domain, pinned.get(domain)
-        if value is None and walk:
-            labels = domain.split(".")
-            for i in range(1, len(labels) - 1):
-                parent = ".".join(labels[i:])
-                if parent in pinned:
-                    location, value = parent, pinned[parent]
-                    break
-        if value is None and self.no_dns:
-            value = "nxdomain"
-        if value is None:
-            self.lookups.append((kind, domain, "live DNS"))
-            return real_fn(domain, **kw)
-        self.lookups.append((kind, domain, value if location == domain else f"{value} (at {location})"))
-        if value in DNS_FAILURES:
-            return {"error": DNS_FAILURES[value]}
-        return ok(value, location)
+    def _check(self, kind, fn, summarize, domain, kw):
+        before = len(self.dns.queries)
+        with self.dns.installed():
+            result = fn(domain, **kw)
+        summary = summarize(result, domain) if "error" not in result else result["error"]
+        if any(q[2] == "live DNS" for q in self.dns.queries[before:]):
+            summary += "  (live DNS)"
+        self.lookups.append((kind, domain, summary))
+        return result
 
     def check_dmarc(self, domain, **kw):
-        return self._answer("dmarc", domain, self.dmarc, dmarc_result,
-                            self.real.check_dmarc, kw, walk=True)
+        def summarize(r, domain):
+            location = (r.get("location") or domain).rstrip(".").lower()
+            return r["record"] + ("" if location == domain else f"  (at {location})")
+        return self._check("dmarc", self.real.check_dmarc, summarize, domain, kw)
 
     def check_spf(self, domain, **kw):
-        # checkdmarc reports the "all" mechanism by result name, not qualifier
-        return self._answer("spf", domain, self.spf,
-                            lambda v, _loc: {"parsed": {"all": SPF_ALL.get(v, v)}},
-                            self.real.check_spf, kw)
-
-
-def dmarc_result(value, location):
-    """checkdmarc's result for a pinned policy: 'reject' or 'p=none;sp=reject'."""
-    tags = {}
-    for part in value.split(";"):
-        tag, sep, v = part.strip().partition("=")
-        if part.strip():
-            tags[tag if sep else "p"] = v if sep else tag
-    if "p" not in tags:
-        sys.exit(f"--dmarc policy {value!r} has no p= tag")
-    tags.setdefault("sp", tags["p"])
-    return {"location": location, "valid": True,
-            "tags": {t: {"value": v, "explicit": True} for t, v in tags.items()}}
+        return self._check("spf", self.real.check_spf, lambda r, _d: r["record"], domain, kw)
 
 
 # --- fake milter context -----------------------------------------------------
@@ -441,7 +517,7 @@ def parse_pins(values, flag):
         domain, sep, answer = v.partition("=")
         if not sep:
             sys.exit(f"{flag} expects DOMAIN=ANSWER, got {v!r}")
-        pins[domain.lower()] = answer.lower()
+        pins[domain.lower()] = answer
     return pins
 
 
@@ -450,9 +526,11 @@ def build_parser():
         description="Run one message through rewriter.py's milter logic offline.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"DNS answers for --dmarc/--spf: a policy (reject, quarantine, none, or tags such as "
-               f"'p=none;sp=reject' / -all, ~all, ?all, +all or fail, softfail, neutral, pass) "
-               f"or a failure ({', '.join(DNS_FAILURES)}). A --dmarc answer also covers the "
-               f"domain's subdomains, as a parent record would.")
+               f"'p=none;sp=reject' / -all, ~all, ?all, +all or fail, softfail, neutral, pass), "
+               f"a whole record ('v=DMARC1; p=reject; rua=mailto:...' / 'v=spf1 ...'), "
+               f"or a failure ({', '.join(DNS_FAILURES)}). The answers are served as DNS "
+               f"records to the real checkdmarc, whose tree walk also finds a --dmarc record "
+               f"for the domain's subdomains.")
     p.add_argument("--from", dest="source", default="sender@example.com",
                    help="From header, e.g. 'Alice <alice@yahoo.com>' (default: %(default)s)")
     p.add_argument("--to", nargs="+", default=None,
@@ -507,11 +585,8 @@ def main(argv=None):
     import rewriter
     import Milter
 
-    fake_dns = FakeCheckdmarc(rewriter.checkdmarc,
-                              parse_pins(args.dmarc, "--dmarc"),
-                              parse_pins(args.spf, "--spf"),
-                              args.no_dns or "checkdmarc" in stubbed)
-    rewriter.checkdmarc = fake_dns
+    fake_dns = FakeDNS(parse_pins(args.dmarc, "--dmarc"), parse_pins(args.spf, "--spf"), args.no_dns)
+    checks = rewriter.checkdmarc = LoggedCheckdmarc(fake_dns)
 
     fanout = args.list is not None
     list_addr = args.list.lower() if fanout else None
@@ -688,7 +763,8 @@ def main(argv=None):
         "milter_actions": [list(a) for a in ctx.actions],
         "db_writes": db.writes,
         "db_queries": [q for q, _params in db.queries],
-        "dns_lookups": [list(x) for x in fake_dns.lookups],
+        "dns_lookups": [list(x) for x in checks.lookups],
+        "dns_queries": [list(x) for x in fake_dns.queries],
         "stubbed_modules": stubbed,
         "warnings": warnings,
         "exception": error,
@@ -728,8 +804,10 @@ def main(argv=None):
         print("db writes:")
         for w in db.writes:
             print(f"    virtual: {w['email']} -> {w['destination']}")
-    if fake_dns.lookups:
-        print("dns:            " + ", ".join(f"{k} {d}={a}" for k, d, a in fake_dns.lookups))
+    if checks.lookups:
+        print("dns:")
+        for kind, domain, answer in checks.lookups:
+            print(f"    {kind} {domain}: {answer}")
     for w in warnings:
         print(f"warning:        {w}")
     if stubbed:
