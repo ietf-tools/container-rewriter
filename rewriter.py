@@ -331,7 +331,26 @@ class EnvelopeMilter(Milter.Base):
         return Milter.CONTINUE
 
     def envrcpt(self, to, *str):
-        self.mail_to.append(email.utils.parseaddr(to)[1])
+        addr = email.utils.parseaddr(to)[1]
+        if is_wrapped(addr):
+            # check the wrap here, not after DATA: refusing one RCPT makes
+            # the sender bounce just that address, while dropping it after
+            # we have accepted the message would lose it (RFC 5321 6.1)
+            try:
+                valid = internal_addr(addr) in valid_wraps([addr])
+            except psycopg.OperationalError as e:
+                logging.info(f"none: wrap lookup for {addr} failed: {e} [{self.id}]")
+                self.setreply("451", "4.3.0", "backend unavailable")
+                return Milter.TEMPFAIL
+            except Exception:
+                logging.exception(f"error: wrap lookup for {addr} failed [{self.id}]")
+                self.setreply("451", "4.3.0", "rewriter internal error")
+                return Milter.TEMPFAIL
+            if not valid:
+                logging.info(f"reject: {addr} has no current wrap record [{self.id}]")
+                self.setreply("550", "5.1.1", "unknown wrapped address")
+                return Milter.REJECT
+        self.mail_to.append(addr)
         return Milter.CONTINUE
 
     def rcpt_keys(self):
@@ -378,19 +397,23 @@ class EnvelopeMilter(Milter.Base):
             self.mail_to[i] = unwrapped_addr
 
     def unwrap_from_headers(self, queue_id):
-        # as postconfirm's dmarc-reverse: deliver to the wrapped addresses
-        # named in To:/Cc:, not to the envelope, and restore them there
+        # as postconfirm's dmarc-reverse, the wrapped addresses in To:/Cc:
+        # are delivered to and restored there; unlike it, the envelope
+        # recipients are kept too, so a Bcc'd wrap still gets its copy
         header_addrs = [addr for _field, value in self.addr_headers
                         for _name, addr in email.utils.getaddresses([value])
                         if addr and is_wrapped(addr)]
         valid = valid_wraps(header_addrs)
-        keep = [a for a in self.mail_to if not is_wrapped(a)]
-        seen = {internal_addr(a) for a in keep}
-        added = []
         for addr in header_addrs:
             if internal_addr(addr) not in valid:
                 logging.info(f"{queue_id} unwrap: {addr} has no current wrap record, not delivered [{self.id}]")
-                continue
+
+        # envelope wraps were checked in envrcpt(), so all of them are valid
+        envelope_wraps = [a for a in self.mail_to if is_wrapped(a)]
+        keep = [a for a in self.mail_to if not is_wrapped(a)]
+        seen = {internal_addr(a) for a in keep}
+        added = []
+        for addr in envelope_wraps + [a for a in header_addrs if internal_addr(a) in valid]:
             unwrapped = unwrap_addr(addr)
             if internal_addr(unwrapped) in seen:
                 continue
@@ -398,13 +421,12 @@ class EnvelopeMilter(Milter.Base):
             added.append(unwrapped)
 
         # delrcpt() must name the recipient exactly as it was given
-        for addr in self.mail_to:
-            if is_wrapped(addr):
-                self.delrcpt(addr)
-                logging.info(f"{queue_id} unwrap: envelope recipient {addr} replaced by header recipients [{self.id}]")
+        for addr in envelope_wraps:
+            self.delrcpt(addr)
+            logging.info(f"{queue_id} unwrap: envelope recipient {addr} unwrapped [{self.id}]")
         for addr in added:
             self.addrcpt(f"<{addr}>")
-            logging.info(f"{queue_id} unwrap: recipient {addr} added from headers [{self.id}]")
+            logging.info(f"{queue_id} unwrap: recipient {addr} added [{self.id}]")
         self.mail_to = keep + added
 
         # chgheader() counts from 1 among headers of the same name
@@ -469,12 +491,6 @@ class EnvelopeMilter(Milter.Base):
                     f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
                 )
                 self.unwrap_from_headers(queue_id)
-                if not self.mail_to:
-                    # e.g. only Bcc'd, or no current wrap record: nothing to
-                    # deliver, as postconfirm's pipe would have failed too
-                    logging.info(f"{queue_id} reject: no valid recipients after unwrapping [{self.id}]")
-                    self.setreply("550", "5.1.1", "no valid recipients")
-                    return Milter.REJECT
                 # other recipients (e.g. a virtual alias on CC) still need
                 # the checks below
                 if only_wrapped and not list_fanout:

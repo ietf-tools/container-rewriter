@@ -101,4 +101,6 @@ def test_bounce_alongside_reply(run):
                  f"alice=40example.com@{FWD}",
                  "--virtual", f"alice=40example.com@{FWD}")
     assert sorted(report["recipients"]) == ["alice@example.com", "ietf-bounces+a=x.test@ietf.org"]
-    assert len(reply_lookups(report)) == 1
+    # alice's wrap is looked up at RCPT and again among the To:/Cc: wraps;
+    # the list bounce never is
+    assert len(reply_lookups(report)) == 2

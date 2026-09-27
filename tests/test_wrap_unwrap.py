@@ -224,23 +224,39 @@ def test_unknown_wraps_in_headers_not_delivered(run):
     assert header_values(report, "Cc") == ["mallory@evil.test"]
 
 
-def test_bcc_wrapped_recipient_dropped(run):
-    """As with postconfirm, a wrapped address only in the envelope gets nothing."""
+def refused(report):
+    return {x["recipient"]: x["reply"] for x in report["refused_recipients"]}
+
+
+def test_bcc_wrapped_recipient_delivered(run):
+    """Unlike postconfirm, a wrapped address only in the envelope still gets
+    its copy: once accepted, a recipient must not be lost (RFC 5321 6.1)."""
     report = run("--from", SENDER, "--to", f"alice=40example.com@{FWD}",
                  "--bcc", f"bcc=40example.org@{FWD}",
                  "--virtual", f"alice=40example.com@{FWD}", "--virtual", f"bcc=40example.org@{FWD}")
     assert report["result"] == "ACCEPT"
-    assert report["recipients"] == ["alice@example.com"]
+    assert report["recipients"] == ["alice@example.com", "bcc@example.org"]
     assert report["warnings"] == []
 
 
-def test_no_valid_recipients_rejected(run):
-    """The To: address has no wrap record and the valid one is only Bcc'd,
-    so nothing is left to deliver to."""
-    report = run("--from", SENDER, "--to", f"nobody=40example.com@{FWD}",
+def test_unknown_wrap_refused_at_rcpt(run):
+    """Only the unknown wrapped recipient is refused; the rest are delivered."""
+    nobody = f"nobody=40example.com@{FWD}"
+    report = run("--from", SENDER, "--to", "carol@elsewhere.test", nobody,
                  "--bcc", f"bcc=40example.org@{FWD}", "--virtual", f"bcc=40example.org@{FWD}")
+    assert refused(report) == {nobody: "550 5.1.1 unknown wrapped address"}
+    assert report["result"] == "ACCEPT"
+    assert report["recipients"] == ["carol@elsewhere.test", "bcc@example.org"]
+    # the refused address was never accepted, so it isn't deleted later
+    assert ["delrcpt", nobody] not in report["milter_actions"]
+
+
+def test_only_unknown_wraps_refuses_message(run):
+    nobody = f"nobody=40example.com@{FWD}"
+    report = run("--from", SENDER, "--to", nobody)
+    assert refused(report) == {nobody: "550 5.1.1 unknown wrapped address"}
     assert report["result"] == "REJECT"
-    assert report["reply"] == "550 5.1.1 no valid recipients"
+    assert report["reply"] == "554 5.5.1 Error: no valid recipients"
 
 
 def test_duplicate_addresses_delivered_once(run):

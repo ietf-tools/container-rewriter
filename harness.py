@@ -596,19 +596,27 @@ def main(argv=None):
     if rc in ("REJECT", "TEMPFAIL"):
         result = rc
 
+    accepted = []
+    refused = []
     if result is None:
-        accepted = []
         for r in recipients:
             tx.c(f"RCPT TO:<{r}>")
+            # a setreply() answers only the command it was made for
+            ctx.reply = None
             rc = code_name(m.envrcpt(f"<{r}>"))
             tx.milter(f"envrcpt(<{r}>) -> {rc}")
-            tx.s(smtp_reply(rc, ctx.reply, "250 2.1.5 Ok"))
-            if rc not in ("REJECT", "TEMPFAIL"):
+            reply = smtp_reply(rc, ctx.reply, "250 2.1.5 Ok")
+            tx.s(reply)
+            if rc in ("REJECT", "TEMPFAIL"):
+                refused.append({"recipient": r, "reply": reply})
+            else:
                 accepted.append(r)
+        ctx.reply = None
         if not accepted:
             result = "REJECT"
+            ctx.reply = "554 5.5.1 Error: no valid recipients"
             tx.c("DATA")
-            tx.s("554 5.5.1 Error: no valid recipients")
+            tx.s(ctx.reply)
 
     if result is None:
         tx.c("DATA")
@@ -641,7 +649,7 @@ def main(argv=None):
     final_from = env_from
     new_header_from = None
     # Postfix matches delrcpt() against the recipient exactly as it was given
-    rcpts = list(recipients)
+    rcpts = list(accepted)
     warnings = []
     for action in ctx.actions:
         if action[0] == "chgfrom":
@@ -672,6 +680,7 @@ def main(argv=None):
                   "recipients": recipients, "auth_user": auth or None},
         "result": result,
         "reply": ctx.reply,
+        "refused_recipients": refused,
         "envelope_from": final_from,
         "header_from": new_header_from or header_from,
         "recipients": rcpts,
@@ -706,9 +715,11 @@ def main(argv=None):
         if name.lower() in ("to", "cc") and before != after:
             print(f"header {name + ':':<9}{changed(before, after)}")
     print("recipients:")
+    refused_replies = {x["recipient"]: x["reply"] for x in refused}
     for r in recipients:
         mark = " " if r in rcpts else "-"
-        print(f"  {mark} {r}" + ("   (on ignore list)" if r in ignored else ""))
+        note = f"   (refused at RCPT: {refused_replies[r]})" if r in refused_replies else ""
+        print(f"  {mark} {r}" + ("   (on ignore list)" if r in ignored else "") + note)
     for r in rcpts:
         if r not in recipients:
             print(f"  + {r}")

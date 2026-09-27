@@ -29,13 +29,17 @@ def test_db_down_tempfails(run):
     assert report["reply"] == "451 4.3.0 backend unavailable"
 
 
+def refused(report):
+    return {x["recipient"]: x["reply"] for x in report["refused_recipients"]}
+
+
 def test_db_down_unwrap_tempfails(run):
-    # without the wrap lookup a reply can't be checked, so it waits rather
-    # than being unwrapped to whatever the headers name
+    # without the wrap lookup the recipient can't be checked, so the sender
+    # is told to retry it at RCPT time
     wrapped = f"carol=40other.test@{FWD}"
     report = run("--db-down", "--from", "bob@y.test", "--to", wrapped)
-    assert report["result"] == "TEMPFAIL"
-    assert report["reply"] == "451 4.3.0 backend unavailable"
+    assert refused(report) == {wrapped: "451 4.3.0 backend unavailable"}
+    assert report["recipients"] == []
 
 
 def test_unwrap_lookup_programming_error(run, rewriter, monkeypatch):
@@ -43,14 +47,14 @@ def test_unwrap_lookup_programming_error(run, rewriter, monkeypatch):
     raise_on(monkeypatch, "updated >=", psycopg.ProgrammingError("relation does not exist"))
     wrapped = f"carol=40other.test@{FWD}"
     report = run("--from", "bob@y.test", "--to", wrapped, "--virtual", wrapped)
-    assert report["result"] == "TEMPFAIL"
-    assert report["reply"] == "451 4.3.0 rewriter internal error"
+    assert refused(report) == {wrapped: "451 4.3.0 rewriter internal error"}
 
 
 def test_unwrap_without_wrap_record(run):
-    report = run("--from", "bob@y.test", "--to", f"carol=40other.test@{FWD}")
+    wrapped = f"carol=40other.test@{FWD}"
+    report = run("--from", "bob@y.test", "--to", wrapped)
+    assert refused(report) == {wrapped: "550 5.1.1 unknown wrapped address"}
     assert report["result"] == "REJECT"
-    assert report["reply"] == "550 5.1.1 no valid recipients"
 
 
 def test_wrap_log_write_failure_is_not_fatal(run, monkeypatch):
