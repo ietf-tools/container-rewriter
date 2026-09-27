@@ -497,18 +497,40 @@ class EnvelopeMilter(Milter.Base):
             list_fanout = auth_user == mailman_sasl_user and bool(listbounce_mailmatch.search(env_from_addr))
 
             # scenario 1
-            if any(is_wrapped(item) for item in self.mail_to):
-                only_wrapped = all(is_wrapped(item) for item in self.mail_to)
-                logging.debug(
-                    f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
-                )
-                self.unwrap_from_headers(queue_id)
-                # other recipients (e.g. a virtual alias on CC) still need
-                # the checks below
-                if only_wrapped and not list_fanout:
-                    # we forward the reply from our IPs, so the replier's SPF
-                    # fails and their DKIM rarely survives the To:/Cc: rewrite
-                    self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
+            if any((match := wrapped_mailmatch.search(item)) for item in self.mail_to):
+                for addr in self.mail_to:
+                    if wrapped_mailmatch.search(addr):
+                        unwrapped_addr = addr.rsplit('@', 1)[0].replace('=40', '@')
+                        try:
+                            with get_db_pool() as pool, pool.connection() as connection, connection.cursor() as cur:
+                                cur.execute("""
+                                            SELECT email FROM
+                                            virtual WHERE email = %s and
+                                            updated >= NOW() - INTERVAL '30 DAYS';
+                                            """, (addr,))
+                                valid_unwraps = cur.fetchall()
+                        except psycopg.OperationalError as e:
+                            logging.info(f"failed to find valid rewrite: {e}")
+                            valid_unwraps = []
+                        except psycopg.ProgrammingError as e:
+                            logging.info(f"failed to find valid rewrite: {e}")
+                            valid_unwraps = []
+                        logging.debug(
+                            f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
+                        )
+                        logging.info(
+                            f"{queue_id} unwrap: from {addr} to {unwrapped_addr} [{self.id}]"
+                        )
+                        if len(valid_unwraps) > 0:
+                            self.delrcpt(addr)
+                            self.addrcpt(f"<{unwrapped_addr}>")
+                            self.mail_to[self.mail_to.index(addr)] = unwrapped_addr
+                        else:
+                            logging.info(f"{queue_id} unwrap: failed to find valid unwrapping addr for {addr}")
+                            self.delrcpt(addr)
+                            self.addrcpt(f"<{unwrapped_addr}>")
+                            self.mail_to[self.mail_to.index(addr)] = unwrapped_addr
+                if not list_fanout:
                     return Milter.ACCEPT
 
             if list_fanout:
