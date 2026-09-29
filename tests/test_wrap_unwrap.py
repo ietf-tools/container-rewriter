@@ -10,6 +10,8 @@ from email.headerregistry import Address
 
 import pytest
 
+import harness
+
 FWD = "dmarc.ietf.org"
 SENDER = "bob@other.test"
 
@@ -360,13 +362,35 @@ def test_bounce_to_wrapped_address(run):
     assert report["db_writes"] == []
 
 
-def test_reply_all_to_list_leaves_from_alone(run):
-    """The list's copy shares the transaction, and mailman must see the real
-    poster, so the From is not rewritten even for a p=reject replier."""
+def test_reply_all_to_list_rewrites_from(run):
+    """The list's copy shares the transaction with the unwrapped reply, which
+    must pass DMARC, so the From is rewritten for both; Postfix's
+    lmtp_generic_maps restores it on the copy delivered to mailman."""
     report = run("--from", "bob@yahoo.test", "--dmarc", "yahoo.test=reject",
                  "--to", "ietf@ietf.org", ALICE, "--virtual", ALICE)
     assert report["recipients"] == ["ietf@ietf.org", "alice@example.com"]
-    assert report["header_from"] == "bob@yahoo.test"
+    assert report["header_from"] == f"bob=40yahoo.test@{FWD}"
+    assert report["envelope_from"] == harness.DEFAULT_ENV["FORWARDING_ADDR"]
+
+
+def test_reply_with_ignored_recipient_rewrites_from(run):
+    """An ignore-list recipient alongside a wrapped one must not leave the
+    unwrapped copy with a From that fails DMARC."""
+    report = run("--from", "bob@yahoo.test", "--dmarc", "yahoo.test=reject",
+                 "--to", ALICE, "ignored@lists.test", "--virtual", ALICE,
+                 "--ignore", "ignored@lists.test")
+    assert "alice@example.com" in report["recipients"]
+    assert report["header_from"] == f"bob=40yahoo.test@{FWD}"
+
+
+def test_reply_to_duplicate_wrap_left_to_usual_checks(run):
+    """A wrap of a recipient already on the message adds no one, so scenario 1
+    doesn't decide; alice is then an off-site recipient alongside the list."""
+    report = run("--from", "bob@yahoo.test", "--dmarc", "yahoo.test=reject",
+                 "--to", "ietf@ietf.org", ALICE, "alice@example.com",
+                 "--virtual", ALICE)
+    assert report["recipients"] == ["ietf@ietf.org", "alice@example.com"]
+    assert report["header_from"] == f"bob=40yahoo.test@{FWD}"
 
 
 # --- recipients that look wrapped but aren't ------------------------------------

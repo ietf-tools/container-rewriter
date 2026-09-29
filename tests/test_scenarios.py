@@ -22,10 +22,18 @@ def untouched(report, env_from=SENDER, header_from=SENDER):
 @pytest.mark.parametrize("to", [
     pytest.param(["ietf@ietf.org"], id="default-list"),
     pytest.param(["TestList@IETF.org"], id="mixed-case"),
-    pytest.param(["testlist@ietf.org", "bob@other.test"], id="with-external"),
+    pytest.param(["ietf@ietf.org", "testlist@ietf.org"], id="two-lists"),
+    pytest.param(["ietf@ietf.org", "ietf-request@ietf.org"], id="with-local"),
 ])
 def test_local_list_recipient_untouched(run, to):
     assert untouched(run("--from", SENDER, *REJECT, "--to", *to))
+
+
+def test_list_with_external_recipient_rewritten(run):
+    """A relayed off-site recipient alongside the list needs a From that
+    passes DMARC; lmtp_generic_maps restores it on mailman's copy."""
+    report = run("--from", SENDER, *REJECT, "--to", "testlist@ietf.org", "bob@other.test")
+    assert report["header_from"] == WRAPPED
 
 
 def test_extra_local_list(run):
@@ -42,6 +50,23 @@ def test_alias_dmarc(run):
     assert report["envelope_from"] == FORWARDING_ADDR
     assert report["header_from"] == WRAPPED
     assert [w["email"] for w in report["db_writes"]] == [WRAPPED]
+
+
+def test_alias_alongside_list_rewritten(run):
+    """The alias forwards off-site, so a list sharing the message must not
+    leave its copy failing DMARC; Postfix's lmtp_generic_maps restores the
+    From on the copy delivered to mailman."""
+    report = run("--from", SENDER, *REJECT, "--to", "ietf@ietf.org", "alias@ietf.org",
+                 "--virtual", "alias@ietf.org")
+    assert report["envelope_from"] == FORWARDING_ADDR
+    assert report["header_from"] == WRAPPED
+    assert [w["email"] for w in report["db_writes"]] == [WRAPPED]
+
+
+def test_alias_alongside_list_no_policy_untouched(run):
+    report = run("--from", SENDER, "--dmarc", "example.com=none",
+                 "--to", "ietf@ietf.org", "alias@ietf.org", "--virtual", "alias@ietf.org")
+    assert untouched(report)
 
 
 def test_alias_spf_only(run):

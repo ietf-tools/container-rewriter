@@ -151,14 +151,9 @@ def test_local_list(email_addr):
         return len(result) > 0
 
 def test_virtual_alias(email_addr):
-    should_ignore = ignore_list & set(email_addr)
-    if not should_ignore:
-        with get_db_pool().connection() as conn, conn.cursor() as cur:
-            cur.execute("SELECT email from virtual where email = ANY(%s)", [email_addr])
-            result = cur.fetchall()
-        return len(result) > 0
-    else:
-        return False
+    with get_db_pool().connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT email from virtual where email = ANY(%s)", [email_addr])
+        return len(cur.fetchall()) > 0
 
 def _dns_temporary_failure(status):
     # a timeout ("... timed out", or "The resolution lifetime expired ..."
@@ -362,6 +357,12 @@ class EnvelopeMilter(Milter.Base):
         # recipients as the lowercased, unquoted keys used in the database
         return [internal_addr(addr) for addr in self.mail_to]
 
+    def offsite_rcpts(self):
+        # recipients we relay straight off-site, which need a From that
+        # passes DMARC; ignored recipients are left to Postfix, whose
+        # transport for them restores the original From
+        return [a for a in self.rcpt_keys() if not check_local(a) and a not in ignore_list]
+
     def header(self, name, value):
         if name.lower() == "from":
             self.header_from = value
@@ -411,7 +412,8 @@ class EnvelopeMilter(Milter.Base):
     def unwrap_from_headers(self, queue_id):
         # as postconfirm's dmarc-reverse, the wrapped addresses in To:/Cc:
         # are delivered to and restored there; unlike it, the envelope
-        # recipients are kept too, so a Bcc'd wrap still gets its copy
+        # recipients are kept too, so a Bcc'd wrap still gets its copy.
+        # Returns the unwrapped recipients it added
         header_addrs = [addr for _field, value in self.addr_headers
                         for _name, addr in email.utils.getaddresses([value])
                         if addr and is_wrapped(addr)]
@@ -449,6 +451,7 @@ class EnvelopeMilter(Milter.Base):
             if new_value is not None:
                 self.chgheader(name, idx, new_value)
                 logging.info(f"{queue_id} unwrap: header-{name} changed from {value} to {new_value} [{self.id}]")
+        return added
 
     def rewrite_forwarded(self, hdr_from_name, hdr_from_addr, env_from_addr, queue_id):
         # a message we pass on from someone else's domain (alias forward,
@@ -498,16 +501,18 @@ class EnvelopeMilter(Milter.Base):
 
             # scenario 1
             if any(is_wrapped(item) for item in self.mail_to):
-                only_wrapped = all(is_wrapped(item) for item in self.mail_to)
                 logging.debug(
                     f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
                 )
-                self.unwrap_from_headers(queue_id)
-                # other recipients (e.g. a virtual alias on CC) still need
-                # the checks below
-                if only_wrapped and not list_fanout:
-                    # we forward the reply from our IPs, so the replier's SPF
-                    # fails and their DKIM rarely survives the To:/Cc: rewrite
+                added = self.unwrap_from_headers(queue_id)
+                # we forward to the unwrapped addresses from our IPs, so the
+                # replier's SPF fails and their DKIM rarely survives the
+                # To:/Cc: rewrite.  Milter changes apply to every copy, so a
+                # local list or ignored recipient alongside is rewritten too
+                # (lmtp_generic_maps restores the From for mailman)
+                if added and not list_fanout:
+                    # a wrapped list bounce may share the message
+                    self.unwrap_list_bounces(queue_id)
                     self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
                     return Milter.ACCEPT
 
@@ -519,17 +524,32 @@ class EnvelopeMilter(Milter.Base):
                 self.unwrap_list_bounces(queue_id)
                 return Milter.ACCEPT
 
-            # scenario 2
-            elif test_local_list(self.rcpt_keys()):
+            # only ignored recipients: nothing to rewrite for.  Alongside
+            # anyone else they are rewritten too, and Postfix's transport
+            # for them restores the original From
+            elif set(self.rcpt_keys()) <= ignore_list:
                 logging.info(
-                    f"{queue_id} none: Local list recipient, no action needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
+                    f"{queue_id} none: Envelope To {self.mail_to} are all ignore list entries [{self.id}]"
                 )
                 return Milter.ACCEPT
-            elif test_virtual_alias(self.rcpt_keys()):
+
+            # scenario 2
+            # an alias forwards off-site, so it needs the rewrite even when a
+            # list shares the message; lmtp_generic_maps restores the From
+            # on the copy delivered to mailman.  An ignored alias wants the
+            # original From, so it doesn't count
+            elif test_virtual_alias([k for k in self.rcpt_keys() if k not in ignore_list]):
                 logging.debug(
                     f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
                 )
                 self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
+                return Milter.ACCEPT
+            # a direct off-site recipient alongside the list still needs the
+            # rewrite below, so the list alone decides only without one
+            elif test_local_list(self.rcpt_keys()) and not self.offsite_rcpts():
+                logging.info(
+                    f"{queue_id} none: Local list recipient, no action needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
+                )
                 return Milter.ACCEPT
             # scenario 3
             if check_local(env_from_addr) and check_local(hdr_from_addr):
@@ -548,12 +568,6 @@ class EnvelopeMilter(Milter.Base):
                 except KeyError:
                     rewrite_domain = forwarding_domain
                 logging.info(f"rewrite domain is {rewrite_domain}")
-                # an ignored subscriber must not exempt a whole mailman batch
-                if not list_fanout and ignore_list & set(self.rcpt_keys()):
-                    logging.info(
-                        f"{queue_id} none: Envelope To {self.mail_to} contains an ignore list entry"
-                    )
-                    return Milter.ACCEPT
                 if check_dmarc(hdr_from_addr):
                     new_hdr_from_addr = wrap_addr(hdr_from_addr, forwarding_domain)
                     self.change_header_from(_hdr_from_name, new_hdr_from_addr)
