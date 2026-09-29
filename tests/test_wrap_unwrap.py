@@ -204,16 +204,25 @@ def test_reply_unwraps_to_header(run, original, wrapped, key, unwrapped):
     assert header_values(report, "To") == [unwrapped]
 
 
-def test_cc_recipients_come_from_headers(run):
-    """Wrapped addresses in Cc: are delivered to, even with only one wrapped
-    envelope recipient."""
+def test_cc_wraps_unwrapped_but_not_added(run):
+    """A wrap only in Cc: is shown unwrapped, but only the envelope's wraps
+    are delivered to; the sender's server sends every wrap it means to."""
     report = run("--from", SENDER, "--to", f"alice=40example.com@{FWD}",
                  "--header", f"Cc: Bob <bob=40other.test@{FWD}>, carol@elsewhere.test",
                  "--virtual", f"alice=40example.com@{FWD}", "--virtual", f"bob=40other.test@{FWD}")
     assert report["result"] == "ACCEPT"
-    assert sorted(report["recipients"]) == ["alice@example.com", "bob@other.test"]
+    assert report["recipients"] == ["alice@example.com"]
     assert header_values(report, "To") == ["alice@example.com"]
     assert header_values(report, "Cc") == ["Bob <bob@other.test>, carol@elsewhere.test"]
+
+
+def test_header_wraps_do_not_fan_out(run):
+    """One wrapped envelope recipient can't reach every valid wrap listed in
+    the headers."""
+    wraps = [f"v{i}=40example{i}.test@{FWD}" for i in range(5)]
+    report = run("--from", SENDER, "--to", wraps[0], "--header", "Cc: " + ", ".join(wraps[1:]),
+                 *[arg for w in wraps for arg in ("--virtual", w)])
+    assert report["recipients"] == ["v0@example0.test"]
 
 
 def test_unknown_wraps_in_headers_not_delivered(run):

@@ -410,24 +410,20 @@ class EnvelopeMilter(Milter.Base):
             self.mail_to[i] = unwrapped_addr
 
     def unwrap_from_headers(self, queue_id):
-        # as postconfirm's dmarc-reverse, the wrapped addresses in To:/Cc:
-        # are delivered to and restored there; unlike it, the envelope
-        # recipients are kept too, so a Bcc'd wrap still gets its copy.
+        # the wrapped envelope recipients are delivered to their original
+        # addresses, and our wraps in To:/Cc: are shown unwrapped.  A wrap
+        # found only in the headers is not added as a recipient: the
+        # sender's server already gave us every wrap it meant to deliver
+        # to, and adding them would let one RCPT fan out to any number of
+        # harvested wraps, past Postfix's recipient checks and limits.
         # Returns the unwrapped recipients it added
-        header_addrs = [addr for _field, value in self.addr_headers
-                        for _name, addr in email.utils.getaddresses([value])
-                        if addr and is_wrapped(addr)]
-        valid = valid_wraps(header_addrs)
-        for addr in header_addrs:
-            if internal_addr(addr) not in valid:
-                logging.info(f"{queue_id} unwrap: {addr} has no current wrap record, not delivered [{self.id}]")
 
         # envelope wraps were checked in envrcpt(), so all of them are valid
         envelope_wraps = [a for a in self.mail_to if is_wrapped(a)]
         keep = [a for a in self.mail_to if not is_wrapped(a)]
         seen = {internal_addr(a) for a in keep}
         added = []
-        for addr in envelope_wraps + [a for a in header_addrs if internal_addr(a) in valid]:
+        for addr in envelope_wraps:
             unwrapped = unwrap_addr(addr)
             if internal_addr(unwrapped) in seen:
                 continue
