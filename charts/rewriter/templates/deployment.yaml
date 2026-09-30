@@ -48,6 +48,8 @@ spec:
               value: {{ .Values.rewriter.rewriteDomains }}
             - name: MAILMAN_SASL_USER
               value: {{ .Values.rewriter.mailmanSaslUser }}
+            - name: IGNORELIST
+              value: {{ .Values.rewriter.ignoreList }}
             - name: DB_HOST
               valueFrom:
                 secretKeyRef:

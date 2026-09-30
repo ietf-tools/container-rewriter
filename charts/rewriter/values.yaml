@@ -13,6 +13,7 @@ rewriter:
   forwardingDomain: myaddr.com
   listeningPort: 8800
   mailmanSaslUser: mailman@ietf.org
+  ignoreList: support@example.com
   localDomains:
     - myaddr.com
   rewriteDomains:
