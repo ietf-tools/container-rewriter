@@ -2,8 +2,8 @@ apiVersion: v2
 description: IETF rewriting milter deployment for kubernetes
 name: rewriter
 type: application
-version: 1.4.12
-appVersion: "1.4.12"
+version: 1.4.13
+appVersion: "1.4.13"
 maintainers:
   - name: Dane Foster
   - name: Sam Sargeant
