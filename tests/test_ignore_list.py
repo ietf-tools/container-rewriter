@@ -1,8 +1,9 @@
 """IGNORELIST: recipients whose messages are never rewritten.
 
-A single message with any ignored recipient is accepted unchanged, whether
-the recipient is external or a virtual alias.  A mailman fan-out is decided
-by its sender alone, so an ignored subscriber doesn't exempt the batch.
+A message whose recipients are all ignored is accepted unchanged, whether
+they are external or virtual aliases.  Alongside other recipients an ignored
+one is rewritten too, and Postfix's transport for it restores the original
+From.  A mailman fan-out is decided by its sender alone.
 Matching is on the whole address, ignoring case and quoting.
 """
 import pytest
@@ -68,9 +69,48 @@ def test_ignored_recipient(send, rcpt, ignore):
     assert report["ignored_recipients"] == [rcpt]
 
 
-def test_one_ignored_recipient_exempts_message(send):
+def test_ignored_recipient_does_not_exempt_others(send):
     report = send("ign@x.test", "bob@y.test", ignore=["ign@x.test"])
-    assert unchanged(report)
+    assert report["header_from"] == WRAPPED_SENDER
+
+
+def test_ignored_recipient_does_not_exempt_alias(send):
+    report = send("alias@ietf.org", "ign@x.test", ignore=["ign@x.test"],
+                  extra=["--virtual", "alias@ietf.org"])
+    assert report["header_from"] == WRAPPED_SENDER
+    assert report["envelope_from"] == "forwardingalgorithm@dmarc.ietf.org"
+
+
+def test_all_recipients_ignored(send):
+    assert unchanged(send("a@x.test", "b@y.test", ignore=["a@x.test", "b@y.test"]))
+
+
+def test_ignored_recipient_alongside_list(send):
+    # both want the original From, so nothing is rewritten
+    assert unchanged(send("ietf@ietf.org", "ign@x.test", ignore=["ign@x.test"]))
+
+
+IGNORED_ALIAS = dict(ignore=["support@ietf.org"], extra=["--virtual", "support@ietf.org"])
+
+
+def test_ignored_alias_alongside_list(send):
+    # an ignored alias doesn't trigger the alias rewrite
+    assert unchanged(send("testlist@ietf.org", "support@ietf.org", **IGNORED_ALIAS))
+
+
+def test_ignored_alias_with_remote_uses_restorable_wraps(send):
+    # the remote recipient decides, through the fall-through, so the envelope
+    # is a wrap Postfix can restore on the ignored copy, not FORWARDING_ADDR
+    report = send("support@ietf.org", "carol@other.test", **IGNORED_ALIAS)
+    assert report["header_from"] == WRAPPED_SENDER
+    assert report["envelope_from"] == WRAPPED_SENDER
+
+
+def test_ignored_alias_with_other_alias_rewritten(send):
+    report = send("support@ietf.org", "alias@ietf.org", ignore=["support@ietf.org"],
+                  extra=["--virtual", "support@ietf.org", "--virtual", "alias@ietf.org"])
+    assert report["header_from"] == WRAPPED_SENDER
+    assert report["envelope_from"] == "forwardingalgorithm@dmarc.ietf.org"
 
 
 def test_any_entry_of_several(send):

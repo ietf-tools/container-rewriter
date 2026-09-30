@@ -10,6 +10,8 @@ from email.headerregistry import Address
 
 import pytest
 
+import harness
+
 FWD = "dmarc.ietf.org"
 SENDER = "bob@other.test"
 
@@ -202,16 +204,25 @@ def test_reply_unwraps_to_header(run, original, wrapped, key, unwrapped):
     assert header_values(report, "To") == [unwrapped]
 
 
-def test_cc_recipients_come_from_headers(run):
-    """Wrapped addresses in Cc: are delivered to, even with only one wrapped
-    envelope recipient."""
+def test_cc_wraps_unwrapped_but_not_added(run):
+    """A wrap only in Cc: is shown unwrapped, but only the envelope's wraps
+    are delivered to; the sender's server sends every wrap it means to."""
     report = run("--from", SENDER, "--to", f"alice=40example.com@{FWD}",
                  "--header", f"Cc: Bob <bob=40other.test@{FWD}>, carol@elsewhere.test",
                  "--virtual", f"alice=40example.com@{FWD}", "--virtual", f"bob=40other.test@{FWD}")
     assert report["result"] == "ACCEPT"
-    assert sorted(report["recipients"]) == ["alice@example.com", "bob@other.test"]
+    assert report["recipients"] == ["alice@example.com"]
     assert header_values(report, "To") == ["alice@example.com"]
     assert header_values(report, "Cc") == ["Bob <bob@other.test>, carol@elsewhere.test"]
+
+
+def test_header_wraps_do_not_fan_out(run):
+    """One wrapped envelope recipient can't reach every valid wrap listed in
+    the headers."""
+    wraps = [f"v{i}=40example{i}.test@{FWD}" for i in range(5)]
+    report = run("--from", SENDER, "--to", wraps[0], "--header", "Cc: " + ", ".join(wraps[1:]),
+                 *[arg for w in wraps for arg in ("--virtual", w)])
+    assert report["recipients"] == ["v0@example0.test"]
 
 
 def test_unknown_wraps_in_headers_not_delivered(run):
@@ -360,13 +371,35 @@ def test_bounce_to_wrapped_address(run):
     assert report["db_writes"] == []
 
 
-def test_reply_all_to_list_leaves_from_alone(run):
-    """The list's copy shares the transaction, and mailman must see the real
-    poster, so the From is not rewritten even for a p=reject replier."""
+def test_reply_all_to_list_rewrites_from(run):
+    """The list's copy shares the transaction with the unwrapped reply, which
+    must pass DMARC, so the From is rewritten for both; Postfix's
+    lmtp_generic_maps restores it on the copy delivered to mailman."""
     report = run("--from", "bob@yahoo.test", "--dmarc", "yahoo.test=reject",
                  "--to", "ietf@ietf.org", ALICE, "--virtual", ALICE)
     assert report["recipients"] == ["ietf@ietf.org", "alice@example.com"]
-    assert report["header_from"] == "bob@yahoo.test"
+    assert report["header_from"] == f"bob=40yahoo.test@{FWD}"
+    assert report["envelope_from"] == harness.DEFAULT_ENV["FORWARDING_ADDR"]
+
+
+def test_reply_with_ignored_recipient_rewrites_from(run):
+    """An ignore-list recipient alongside a wrapped one must not leave the
+    unwrapped copy with a From that fails DMARC."""
+    report = run("--from", "bob@yahoo.test", "--dmarc", "yahoo.test=reject",
+                 "--to", ALICE, "ignored@lists.test", "--virtual", ALICE,
+                 "--ignore", "ignored@lists.test")
+    assert "alice@example.com" in report["recipients"]
+    assert report["header_from"] == f"bob=40yahoo.test@{FWD}"
+
+
+def test_reply_to_duplicate_wrap_left_to_usual_checks(run):
+    """A wrap of a recipient already on the message adds no one, so scenario 1
+    doesn't decide; alice is then an off-site recipient alongside the list."""
+    report = run("--from", "bob@yahoo.test", "--dmarc", "yahoo.test=reject",
+                 "--to", "ietf@ietf.org", ALICE, "alice@example.com",
+                 "--virtual", ALICE)
+    assert report["recipients"] == ["ietf@ietf.org", "alice@example.com"]
+    assert report["header_from"] == f"bob=40yahoo.test@{FWD}"
 
 
 # --- recipients that look wrapped but aren't ------------------------------------
