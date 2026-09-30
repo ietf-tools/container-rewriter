@@ -12,6 +12,7 @@ rewriter:
   forwardingAddr: forwardingalgorithm@myaddr.com
   forwardingDomain: myaddr.com
   listeningPort: 8800
+  mailmanSaslUser: mailman@ietf.org
   localDomains:
     - myaddr.com
   rewriteDomains:
