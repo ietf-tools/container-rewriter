@@ -25,6 +25,9 @@ def parse_ignore_list(value):
     return {x.strip().lower() for x in value.split(',') if x.strip()}
 
 ignore_list = parse_ignore_list(os.environ.get("IGNORELIST", "alldanes@lists.sys.slush.ca"))
+# Postfix's recipient_delimiter: user+ext@domain is looked up as itself,
+# then as user@domain
+recipient_delimiter = os.environ.get("RECIPIENT_DELIMITER", "+")
 mailman_sasl_user = os.environ.get("MAILMAN_SASL_USER", "mailman@ietf.org").lower()
 
 _policy_cache = ExpiringDict(max_len=50000, max_age_seconds=1800)
@@ -144,6 +147,19 @@ def get_db_pool() -> ConnectionPool:
     return _db_pool
 
 
+def lookup_keys(key):
+    # the keys Postfix tries for an address, in order: user+ext@domain, then
+    # user@domain; the extension starts at the first delimiter character
+    local, at, domain = key.rpartition('@')
+    for i, ch in enumerate(local):
+        if ch in recipient_delimiter:
+            return [key, f"{local[:i]}{at}{domain}"]
+    return [key]
+
+def is_ignored(key):
+    # an ignore list entry also covers its +extension addresses
+    return any(k in ignore_list for k in lookup_keys(key))
+
 def test_local_list(email_addr):
     with get_db_pool().connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT list from mailman_lists where list = ANY(%s)", [email_addr])
@@ -151,8 +167,10 @@ def test_local_list(email_addr):
         return len(result) > 0
 
 def test_virtual_alias(email_addr):
+    # alias+ext@domain is expanded through alias@domain, as Postfix does
+    keys = [k for addr in email_addr for k in lookup_keys(addr)]
     with get_db_pool().connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT email from virtual where email = ANY(%s)", [email_addr])
+        cur.execute("SELECT email from virtual where email = ANY(%s)", [keys])
         return len(cur.fetchall()) > 0
 
 def _dns_temporary_failure(status):
@@ -332,6 +350,12 @@ class EnvelopeMilter(Milter.Base):
 
     def envrcpt(self, to, *str):
         addr = email.utils.parseaddr(to)[1]
+        if not is_wrapped(addr) and is_wrapped(lookup_keys(internal_addr(addr))[-1]):
+            # Postfix would deliver wrap+ext@ through the wrap's row, past
+            # the check below (and its expiry); nobody needs one
+            logging.info(f"reject: {addr} is a wrapped address with an extension [{self.id}]")
+            self.setreply("550", "5.1.1", "unknown wrapped address")
+            return Milter.REJECT
         if is_wrapped(addr):
             # check the wrap here, not after DATA: refusing one RCPT makes
             # the sender bounce just that address, while dropping it after
@@ -361,7 +385,7 @@ class EnvelopeMilter(Milter.Base):
         # recipients we relay straight off-site, which need a From that
         # passes DMARC; ignored recipients are left to Postfix, whose
         # transport for them restores the original From
-        return [a for a in self.rcpt_keys() if not check_local(a) and a not in ignore_list]
+        return [a for a in self.rcpt_keys() if not check_local(a) and not is_ignored(a)]
 
     def header(self, name, value):
         if name.lower() == "from":
@@ -523,7 +547,7 @@ class EnvelopeMilter(Milter.Base):
             # only ignored recipients: nothing to rewrite for.  Alongside
             # anyone else they are rewritten too, and Postfix's transport
             # for them restores the original From
-            elif set(self.rcpt_keys()) <= ignore_list:
+            elif all(is_ignored(k) for k in self.rcpt_keys()):
                 logging.info(
                     f"{queue_id} none: Envelope To {self.mail_to} are all ignore list entries [{self.id}]"
                 )
@@ -534,7 +558,7 @@ class EnvelopeMilter(Milter.Base):
             # list shares the message; lmtp_generic_maps restores the From
             # on the copy delivered to mailman.  An ignored alias wants the
             # original From, so it doesn't count
-            elif test_virtual_alias([k for k in self.rcpt_keys() if k not in ignore_list]):
+            elif test_virtual_alias([k for k in self.rcpt_keys() if not is_ignored(k)]):
                 logging.debug(
                     f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
                 )
