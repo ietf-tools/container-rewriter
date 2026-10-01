@@ -113,6 +113,18 @@ def test_ignored_alias_with_other_alias_rewritten(send):
     assert report["envelope_from"] == "forwardingalgorithm@dmarc.ietf.org"
 
 
+def test_extension_of_ignored_address(send):
+    # Postfix delivers ietf-ipr+token@ through ietf-ipr@, so it is ignored too
+    report = send("ietf-ipr+h2NLhA7z56cuaDLb@ietf.org", ignore=["ietf-ipr@ietf.org"],
+                  extra=["--virtual", "ietf-ipr@ietf.org"])
+    assert unchanged(report)
+
+
+def test_entry_with_extension_covers_only_itself(send):
+    assert send("ign@x.test", ignore=["ign+a@x.test"])["header_from"] == WRAPPED_SENDER
+    assert unchanged(send("ign+a@x.test", ignore=["ign+a@x.test"]))
+
+
 def test_any_entry_of_several(send):
     report = send("b@y.test", ignore=["a@x.test", "b@y.test", "c@z.test"])
     assert unchanged(report)

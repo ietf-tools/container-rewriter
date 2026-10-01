@@ -262,6 +262,16 @@ def test_unknown_wrap_refused_at_rcpt(run):
     assert ["delrcpt", nobody] not in report["milter_actions"]
 
 
+def test_wrap_with_extension_refused(run):
+    """Postfix would deliver wrap+ext@ through the wrap's row, skipping the
+    RCPT check and its expiry, so it is refused."""
+    addr = f"bob=40example.com+x@{FWD}"
+    report = run("--from", SENDER, "--to", "carol@elsewhere.test", addr,
+                 "--virtual", f"bob=40example.com@{FWD}")
+    assert refused(report) == {addr: "550 5.1.1 unknown wrapped address"}
+    assert report["recipients"] == ["carol@elsewhere.test"]
+
+
 def test_only_unknown_wraps_refuses_message(run):
     nobody = f"nobody=40example.com@{FWD}"
     report = run("--from", SENDER, "--to", nobody)

@@ -63,6 +63,15 @@ def test_alias_alongside_list_rewritten(run):
     assert [w["email"] for w in report["db_writes"]] == [WRAPPED]
 
 
+def test_alias_extension_alongside_list_rewritten(run):
+    """alias+tag@ is expanded through alias@ by Postfix, so it counts as the
+    alias even beside a list."""
+    report = run("--from", SENDER, *REJECT, "--to", "ietf@ietf.org", "alias+tag@ietf.org",
+                 "--virtual", "alias@ietf.org")
+    assert report["envelope_from"] == FORWARDING_ADDR
+    assert report["header_from"] == WRAPPED
+
+
 def test_alias_alongside_list_no_policy_untouched(run):
     report = run("--from", SENDER, "--dmarc", "example.com=none",
                  "--to", "ietf@ietf.org", "alias@ietf.org", "--virtual", "alias@ietf.org")
