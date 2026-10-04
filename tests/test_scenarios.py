@@ -36,11 +36,14 @@ def test_list_with_external_recipient_rewritten(run):
     assert report["header_from"] == WRAPPED
 
 
-def test_extra_local_list(run):
-    assert untouched(run("--from", SENDER, *REJECT, "--to", "other@ietf.org",
-                         "--local-list", "other@ietf.org"))
-    # without it, other@ietf.org is just an external-looking recipient
-    assert run("--from", SENDER, *REJECT, "--to", "other@ietf.org")["header_from"] == WRAPPED
+@pytest.mark.parametrize("to", [
+    pytest.param("other@ietf.org", id="local-not-a-list"),
+    pytest.param("ietf-request@ietf.org", id="mailman-request"),
+])
+def test_local_recipient_untouched_without_list(run, to):
+    """A recipient in LOCAL_DOMAINS that is neither an alias nor a list is
+    delivered to mailman here, so it needs no rewrite."""
+    assert untouched(run("--from", SENDER, *REJECT, "--to", to))
 
 
 # --- scenario 2: virtual alias recipient ----------------------------------------

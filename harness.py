@@ -66,9 +66,6 @@ DEFAULT_ENV = {
 
 QUEUE_ID = "HARNESS01"
 
-# always present in mailman_lists, so test_local_list() matches them
-DEFAULT_LOCAL_LISTS = ("ietf@ietf.org", "testlist@ietf.org")
-
 
 # --- stubs for modules that may not be installed locally --------------------
 
@@ -178,8 +175,7 @@ def install_stubs():
 class FakeDB:
     """Answers the queries rewriter.py issues against the postfix database."""
 
-    def __init__(self, lists, virtual, down):
-        self.lists = set(lists)
+    def __init__(self, virtual, down):
         self.virtual = set(virtual)
         self.down = down
         self.writes = []
@@ -210,9 +206,7 @@ class FakeCursor:
     def execute(self, sql, params=()):
         q = " ".join(sql.split()).lower()
         self.db.queries.append((q, params))
-        if "from mailman_lists" in q:
-            self.rows = [(a,) for a in params[0] if a in self.db.lists]
-        elif "from virtual" in q and "any(" in q:
+        if "from virtual" in q and "any(" in q:
             self.rows = [(a,) for a in params[0] if a in self.db.virtual]
         elif "from virtual" in q and "email = %s" in q:
             self.rows = [(params[0],)] if params[0] in self.db.virtual else []
@@ -548,11 +542,6 @@ def build_parser():
                    help="envelope sender (MAIL FROM); default: the --from address, or "
                         "<list>-bounces@<domain> for a fan-out. Use '' for the null sender <>")
     p.add_argument("--auth", help="override the SASL user ({auth_authen})")
-    p.add_argument("--local-list", action="append", default=[], metavar="ADDR",
-                   help="extra address in mailman_lists (the --list address and "
-                        f"{', '.join(DEFAULT_LOCAL_LISTS)} are always there)")
-    p.add_argument("--no-default-lists", action="store_true",
-                   help=f"leave {', '.join(DEFAULT_LOCAL_LISTS)} out of mailman_lists")
     p.add_argument("--virtual", action="append", default=[], metavar="ADDR",
                    help="address present in the virtual table (aliases and valid wraps)")
     p.add_argument("--ignore", action="append", metavar="ADDR",
@@ -594,11 +583,7 @@ def main(argv=None):
         list_local, list_domain = list_addr.rsplit("@", 1)
     elif not args.to:
         build_parser().error("--to is required unless --list is given")
-    local_lists = {*(() if args.no_default_lists else DEFAULT_LOCAL_LISTS),
-                   *([list_addr] if fanout else []),
-                   *(a.lower() for a in args.local_list)}
-    db = FakeDB(lists=local_lists,
-                virtual=(a.lower() for a in args.virtual),
+    db = FakeDB(virtual=(a.lower() for a in args.virtual),
                 down=args.db_down)
     rewriter.get_db_pool = lambda: db
     # applied on every run, not only at import, so one process can run many

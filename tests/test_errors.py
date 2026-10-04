@@ -67,14 +67,6 @@ def test_wrap_log_write_failure_is_not_fatal(run, monkeypatch):
     assert report["db_writes"] == []
 
 
-def test_local_list_query_programming_error(run, monkeypatch):
-    import psycopg
-    raise_on(monkeypatch, "from mailman_lists", psycopg.ProgrammingError("relation does not exist"))
-    report = run("--from", SENDER, *REJECT, "--to", "bob@other.test")
-    assert report["result"] == "TEMPFAIL"
-    assert report["reply"] == "451 4.3.0 rewriter internal error"
-
-
 # --- unexpected exceptions ------------------------------------------------------
 
 def test_exception_before_queue_id(run, monkeypatch):

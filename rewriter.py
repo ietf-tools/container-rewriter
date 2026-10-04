@@ -160,12 +160,6 @@ def is_ignored(key):
     # an ignore list entry also covers its +extension addresses
     return any(k in ignore_list for k in lookup_keys(key))
 
-def test_local_list(email_addr):
-    with get_db_pool().connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT list from mailman_lists where list = ANY(%s)", [email_addr])
-        result = cur.fetchall()
-        return len(result) > 0
-
 def test_virtual_alias(email_addr):
     # alias+ext@domain is expanded through alias@domain, as Postfix does
     keys = [k for addr in email_addr for k in lookup_keys(addr)]
@@ -564,11 +558,13 @@ class EnvelopeMilter(Milter.Base):
                 )
                 self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
                 return Milter.ACCEPT
-            # a direct off-site recipient alongside the list still needs the
-            # rewrite below, so the list alone decides only without one
-            elif test_local_list(self.rcpt_keys()) and not self.offsite_rcpts():
+            # wraps and aliases are handled above, and Postfix only accepts
+            # mailman's addresses or aliases in our domains, so the rest are
+            # delivered to mailman here; a direct off-site recipient still
+            # needs the rewrite below
+            elif not self.offsite_rcpts():
                 logging.info(
-                    f"{queue_id} none: Local list recipient, no action needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
+                    f"{queue_id} none: no off-site recipients, no action needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
                 )
                 return Milter.ACCEPT
             # scenario 3
