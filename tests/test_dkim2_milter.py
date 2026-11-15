@@ -234,6 +234,111 @@ def test_plain_mail_arrives_as_none(dkim2):
     assert sent.value("X-DKIM2-Arrival") == "none"
 
 
+# --- header fields changed on arrival ---------------------------------------------
+
+WRAP = "bob=40example.org@dmarc.ietf.org"
+UNWRAPPED = "bob@example.org"
+
+
+def to_list_and_wrap(keys, signed=True):
+    """A post to the list and to one of our wrapped addresses."""
+    keydir, dns = keys
+    plain = fields(("From", f"Alice <{AUTHOR}>"), ("To", f"{LIST}, {WRAP}"), ("Subject", "hello"))
+    if not signed:
+        return plain
+    made = dkim2hop.sign(dkim2hop.stream(plain, BODY, dns=dns, arriving=False), plain,
+                         AUTHOR, [LIST, WRAP], keydir, timestamp=T)
+    assert made, made.reason
+    return fields(*made.insert) + plain
+
+
+@pytest.fixture
+def our_key_only(dkim2, keys, monkeypatch, tmp_path):
+    """As deployed: a key for our domain, none for the author's."""
+    import shutil
+    keydir, _dns = keys
+    post = to_list_and_wrap(keys)
+    shutil.copytree(os.path.join(keydir, "ietf.org"), tmp_path / "ietf.org")
+    monkeypatch.setattr(dkim2, "dkim2_keydir", str(tmp_path))
+    monkeypatch.setattr(dkim2, "get_db_pool", lambda: harness.FakeDB(virtual=[WRAP], down=False))
+    return post
+
+
+def test_unwrapped_to_is_recorded_when_we_do_not_sign(dkim2, keys, our_key_only):
+    """To is shown unwrapped, which changes a hashed field on every copy.
+    Nothing makes us take the envelope over, so we have no key to sign
+    with: the change goes into an unsigned instance instead, and the chain
+    on the copy mailman gets still describes the message."""
+    sent = send(dkim2, our_key_only, BODY, AUTHOR, [LIST, WRAP])
+    assert sent.rcpts == [LIST, UNWRAPPED]
+    assert sent.value("To") == f"{LIST}, {UNWRAPPED}"
+    assert len(sent.named("DKIM2-Signature")) == 1
+    assert [f.split(b";")[0].split(b"=")[1] for f in sent.named("Message-Instance")] == [b"2", b"1"]
+    assert dkim2hop.stream(sent.fields, BODY, dns=dkim2.dkim2_dns, arriving=False).result().status == "pass"
+
+    # mailman records its changes on top, and the fan-out signs for all three
+    out, body = through_mailman(sent.fields)
+    copy = send(dkim2, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
+    assert [f.split(b";")[0].split(b"=")[1] for f in copy.named("Message-Instance")] == [b"4", b"3", b"2", b"1"]
+    assert [copy.tag("DKIM2-Signature", "i"), copy.tag("DKIM2-Signature", "m")] == ["2", "4"]
+    assert copy.value("From") == f"Alice <{WRAPPED}>"
+    result = verified(dkim2, copy)
+    assert result.status == "pass", result.message
+
+
+def versions(sent):
+    """The m= of each Message-Instance, topmost first."""
+    return [f.split(b";")[0].split(b"=")[1].decode() for f in sent.named("Message-Instance")]
+
+
+def test_unwrapped_to_on_an_unsigned_post_is_recorded_too(dkim2, keys, our_key_only):
+    """No chain yet, and we still say what we did: m=1 is the post as it
+    arrived, m=2 has the Recipe back to it.  Nobody has signed, so this
+    means nothing outside; the list fan-out signs over both."""
+    sent = send(dkim2, to_list_and_wrap(keys, signed=False), BODY, AUTHOR, [LIST, WRAP])
+    assert sent.value("To") == f"{LIST}, {UNWRAPPED}"
+    assert sent.named("DKIM2-Signature") == []
+    assert versions(sent) == ["2", "1"]
+    assert dkim2hop.stream(sent.fields, BODY, dns=dkim2.dkim2_dns, arriving=False).result().status == "pass"
+    # undoing m=2 gives the To that arrived
+    recipe = base64.b64decode(sent.tag("Message-Instance", "r")).decode()
+    assert WRAP in recipe
+
+
+def test_changes_are_recorded_with_verification_only(dkim2, keys, our_key_only, monkeypatch):
+    """No key directory at all: nothing is ever signed, and the change is
+    still recorded."""
+    monkeypatch.setattr(dkim2, "dkim2_keydir", None)
+    sent = send(dkim2, our_key_only, BODY, AUTHOR, [LIST, WRAP])
+    assert len(sent.named("DKIM2-Signature")) == 1
+    assert versions(sent) == ["2", "1"]
+
+
+def test_from_taken_over_for_an_alias_is_recorded(dkim2, keys, monkeypatch):
+    """An alias is a local recipient: this transaction relays nothing
+    off-site, so nothing is signed here.  The DMARC rule still wraps From,
+    and that is recorded."""
+    alias = "chair@ietf.org"
+    pins = harness.parse_pins(["example.com=reject"], "--dmarc")
+    monkeypatch.setattr(dkim2, "checkdmarc", harness.LoggedCheckdmarc(harness.FakeDNS(pins, {}, True)))
+    monkeypatch.setattr(dkim2, "get_db_pool", lambda: harness.FakeDB(virtual=[alias], down=False))
+    dkim2._policy_cache.clear()
+    sent = send(dkim2, author_post(keys), BODY, AUTHOR, [alias])
+    assert sent.value("From") == f"Alice <{WRAPPED}>"
+    assert len(sent.named("DKIM2-Signature")) == 1
+    assert versions(sent) == ["2", "1"]
+    assert dkim2hop.stream(sent.fields, BODY, dns=dkim2.dkim2_dns, arriving=False).result().status == "pass"
+
+
+def test_changes_are_recorded_on_a_chain_that_failed(dkim2, keys, our_key_only):
+    """The chain was already broken when it arrived.  We do not sign, and
+    we still record our own change on top of it."""
+    sent = send(dkim2, our_key_only, BODY + b"tampered\r\n", AUTHOR, [LIST, WRAP])
+    assert sent.value("X-DKIM2-Arrival") == "fail"
+    assert len(sent.named("DKIM2-Signature")) == 1
+    assert versions(sent) == ["2", "1"]
+
+
 # --- list fan-out ---------------------------------------------------------------
 
 def test_footer_means_new_from_and_a_verifiable_chain(dkim2, keys):
@@ -326,7 +431,9 @@ def test_unsigned_post_rewritten_for_dmarc_starts_a_chain(dkim2, monkeypatch):
     sent = send(dkim2, fields(*UNSIGNED), BODY + FOOTER, BOUNCES,
                 [SUBSCRIBER, "other@example.org"], auth=MAILMAN)
     assert sent.value("From") == f"Alice <{WRAPPED}>"
-    assert [sent.tag("Message-Instance", "m"), sent.tag("DKIM2-Signature", "i")] == ["1", "1"]
+    # m=1 is the post as mailman handed it over, m=2 our change of From
+    assert versions(sent) == ["2", "1"]
+    assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["1", "2"]
     # every recipient of the transaction is named together
     rt = [base64.b64decode(x).decode() for x in sent.tag("DKIM2-Signature", "rt").split(",")]
     assert rt == [f"<{SUBSCRIBER}>", "<other@example.org>"]

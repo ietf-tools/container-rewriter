@@ -3,7 +3,7 @@
 The rewriter is the hop that changes a message's From, To and Cc and its
 envelope, so it is the one place that knows both what the message looked
 like before and what it will be sent as.  This module turns that into the
-two things DKIM2 asks of such a hop:
+things DKIM2 asks of such a hop:
 
   verify()  on the way in: is the chain of DKIM2-Signature and
             Message-Instance fields the message arrived with intact, and
@@ -12,6 +12,10 @@ two things DKIM2 asks of such a hop:
   sign()    on the way out: a Message-Instance recording what the rewriter
             changed (with a Recipe that puts the old header fields back),
             and a DKIM2-Signature over the envelope the message leaves in.
+
+  record()  when the rewriter changed the message but is not the one to
+            sign it: the Message-Instance alone, for a later hop of ours
+            to sign over.
 
 Nothing here talks to the milter.  It takes and returns header fields and
 bytes, so it can be tested without one; rewriter.py does the wiring.
@@ -321,6 +325,74 @@ def _for_milter(field):
     return name.decode("ascii"), fold(value)
 
 
+def _instances(seen, after):
+    """The Message-Instance fields that say what the rewriter changed,
+    topmost first; empty if it changed nothing DKIM2 hashes.
+
+    A message that has instances gets the next m=, with a Recipe that
+    restores the header fields the rewriter changed.  Every instance
+    already there stays, signed or not: one nobody has signed is another
+    of our own hops' (the rewriter on arrival, the list manager), handed
+    to us over a path we trust.
+
+    A message with none gets two: m=1 for the message as we were handed
+    it, and m=2 with the Recipe back to that.
+    """
+    before = seen.fields
+    if (dkim2sign.compute_header_hash(_bare(before))
+            == dkim2sign.compute_header_hash(_bare(after))):
+        return []
+    body_hashes = {"sha256": seen.body_hash("sha256")}
+    instances = [f.decode("utf-8", "surrogateescape") for f in after
+                 if _name(f) == b"message-instance"]
+    first = []
+    if instances:
+        version = max(dkim2sign._get_version_from_mi(f) for f in instances) + 1
+    else:
+        first = [dkim2sign.build_message_instance_from_hashes(_bare(before), body_hashes)]
+        version = 2
+    # header fields only: the body is the one we were given
+    recipe = dkim2sign.build_recipes(_bare(before), b"", _bare(after), b"")
+    mine = dkim2sign.build_message_instance_from_hashes(
+        _bare(after), body_hashes, version=version, recipe=recipe)
+    return [f.encode("utf-8") + CRLF for f in [mine] + first]
+
+
+def _has_chain(header_fields):
+    return any(_name(f) in (b"message-instance", b"dkim2-signature") for f in header_fields)
+
+
+def record(seen, after):
+    """Record a change the rewriter is not signing for.
+
+    Whenever the rewriter changes a header field DKIM2 hashes it says so
+    in a Message-Instance, whether or not it goes on to sign: with no key
+    for the envelope sender, a From that is not ours, a copy that is not
+    leaving, or a chain that had already failed.  Unsigned, the instance
+    means nothing to a verifier outside -- but the chain would not have
+    verified there with the change unrecorded either, and this way the
+    message says what we did.  A later hop of ours (the list fan-out)
+    signs over it.
+
+    seen and after are sign()'s.  Returns a Signed with the fields to
+    insert, or with .reason when there is nothing to record (no hashed
+    header field changed) or no way to (the body was not hashed, or the
+    instances on the message are not numbered as a chain).
+    """
+    if not seen.hashed:
+        return Signed(reason="the body was not hashed")
+    existing = [f.decode("utf-8", "surrogateescape") for f in after]
+    numbering = dkim2sign.chain_range_error(
+        [f for f in existing if f.lower().startswith("message-instance:")],
+        [f for f in existing if f.lower().startswith("dkim2-signature:")])
+    if numbering:
+        return Signed(reason=clean(numbering))
+    mine = _instances(seen, after)
+    if not mine:
+        return Signed(reason="no hashed header field changed")
+    return Signed(insert=[_for_milter(f) for f in mine])
+
+
 def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
          timestamp=None, selector=None):
     """Sign a message the rewriter is sending on.
@@ -337,14 +409,13 @@ def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
              see find_key()
     exploded the message is one of many copies (a list's fan-out)
 
-    A message that already has Message-Instance fields gets the next one,
-    with a Recipe that restores the header fields the rewriter changed,
-    and the next signature (the first, if nobody has signed yet).  The
-    signature covers every instance below it, so instances nobody signed
-    -- our list manager's -- are answered for by us: they reached us over
-    a path we trust.  They must still describe the message: a chain that
-    does not verify is not signed (-09 section 12).  A message with no
-    DKIM2 fields gets m=1 and i=1.
+    The rewriter's header changes are recorded first (_instances()), and
+    the signature covers every instance below it, so instances nobody
+    signed -- the rewriter's own from the message's arrival, the list
+    manager's -- are answered for here: they reached us over a path we
+    trust.  They must still describe the message: a chain that does not
+    verify is not signed (-09 section 12).  A message with no DKIM2 fields
+    that the rewriter did not change gets m=1 and i=1.
 
     Returns a Signed.  Nothing is signed (and .reason says why) when there
     is no key for the sender's domain, the sender is null, the existing
@@ -357,38 +428,20 @@ def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
         return Signed(reason=f"no signing key for {_domain(mail_from)}")
     domain, selector, keyfile = key
 
-    def is_field(field, name):
-        return _name(field) == name
-
     if not seen.hashed:
         return Signed(reason="the body was not hashed", domain=domain)
-    before = seen.fields
+    mine = _instances(seen, after)
+    after = mine + after
     body_hashes = {"sha256": seen.body_hash("sha256")}
-    instances = [f for f in after if is_field(f, b"message-instance")]
-    signatures = [f for f in after if is_field(f, b"dkim2-signature")]
-    changed = (dkim2sign.compute_header_hash(_bare(before))
-               != dkim2sign.compute_header_hash(_bare(after)))
-
-    mine = []
-    if instances and changed:
-        # Every instance already here stays, signed or not: one nobody has
-        # signed is our own list manager's, handed to us over a path we
-        # trust, and our signature covers it along with ours.  The gate
-        # below still has to find that they describe the message we got.
-        version = max(dkim2sign._get_version_from_mi(f.decode("utf-8", "surrogateescape"))
-                      for f in instances) + 1
-        # header fields only: the body is the one we were given
-        recipe = dkim2sign.build_recipes(_bare(before), b"", _bare(after), b"")
-        mi = dkim2sign.build_message_instance_from_hashes(
-            _bare(after), body_hashes, version=version, recipe=recipe)
-        mine = [mi.encode("utf-8") + CRLF]
-        after = mine + after
 
     try:
         added = dkim2sign.sign_fields(
             _bare(after), body_hashes, selector, domain, keyfile,
             mailfrom=_path(mail_from), rcptto=[_path(r) for r in rcpt_to],
-            timestamp=timestamp, upstream=seen.result(), exploded=exploded)
+            timestamp=timestamp, upstream=seen.result(), exploded=exploded,
+            # with no DKIM2 field on the message we were handed, the only
+            # instances are the ones just made: nothing upstream to gate on
+            skip_upstream_check=not _has_chain(seen.fields))
     except dkim2sign.SigningRefused as e:
         return Signed(reason=clean(e), domain=domain)
     except (OSError, ValueError) as e:

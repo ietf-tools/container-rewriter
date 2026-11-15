@@ -195,6 +195,72 @@ def test_unsigned_instance_that_is_not_this_message_is_refused(keys):
     assert not signed and signed.reason.startswith("not signing")
 
 
+# --- recording a change we do not sign for -----------------------------------------
+
+def test_change_we_do_not_sign_is_recorded_in_an_unsigned_instance(keys):
+    """The rewriter changed a hashed header field of a signed message and
+    will not sign (no key for the sender): the chain still gets the next
+    instance, so whoever of ours signs later can cover it."""
+    keydir, dns = keys
+    arrived = post(keys)
+    after = [dkim2hop.header_field("To", "someone@example.net") if dkim2hop._name(f) == b"to" else f
+             for f in arrived]
+    recorded = dkim2hop.record(dkim2hop.stream(arrived, BODY, "alice@example.com", [LIST], dns), after)
+    assert recorded, recorded.reason
+    assert [n for n, _v in recorded.insert] == ["Message-Instance"]
+    sent = apply(recorded, after)
+    assert [tag(f, "m") for f in named(sent, b"message-instance")] == ["2", "1"]
+    recipe = json.loads(base64.b64decode(tag(named(sent, b"message-instance")[0], "r")))
+    assert list(recipe) == ["h"] and list(recipe["h"]) == ["to"]
+    # as the next of our hops sees it: a chain that verifies, with one
+    # instance nobody has signed yet
+    assert dkim2hop.stream(sent, BODY, dns=dns, arriving=False).result().status == "pass"
+    # and that hop signs over it
+    signed = dkim2hop.sign(dkim2hop.stream(sent, BODY, dns=dns, arriving=False), sent, BOUNCES,
+                           ["sub@example.net"], keydir, exploded=True, timestamp=T)
+    assert signed, signed.reason
+    final = apply(signed, sent)
+    assert (tag(named(final, b"dkim2-signature")[0], "i"), tag(named(final, b"dkim2-signature")[0], "m")) == ("2", "2")
+    assert dkim2hop.verify(final, BODY, BOUNCES, ["sub@example.net"], dns).status == "pass"
+
+
+def test_change_to_a_message_with_no_chain_is_recorded_from_m1(keys):
+    _keydir, dns = keys
+    plain = fields(("From", "a@example.com"), ("To", LIST))
+    changed = fields(("From", "a@example.com"), ("To", "someone@example.net"))
+    recorded = dkim2hop.record(dkim2hop.stream(plain, BODY, "a@example.com", [LIST], dns), changed)
+    assert [n for n, _v in recorded.insert] == ["Message-Instance", "Message-Instance"]
+    sent = apply(recorded, changed)
+    assert [tag(f, "m") for f in named(sent, b"message-instance")] == ["2", "1"]
+    # m=1 is the message as it was handed to us: nothing to undo
+    assert tag(named(sent, b"message-instance")[1], "r") is None
+    assert dkim2hop.stream(sent, BODY, dns=dns, arriving=False).result().status == "pass"
+
+
+def test_change_to_a_chain_that_failed_is_still_recorded(keys):
+    _keydir, dns = keys
+    arrived = post(keys)
+    broken = dkim2hop.stream(arrived, BODY + b"more\r\n", "alice@example.com", [LIST], dns)
+    assert broken.result().status == "fail"
+    after = [dkim2hop.header_field("To", "someone@example.net") if dkim2hop._name(f) == b"to" else f
+             for f in arrived]
+    recorded = dkim2hop.record(broken, after)
+    assert [tag(dkim2hop.header_field(n, v), "m") for n, v in recorded.insert] == ["2"]
+
+
+def test_nothing_is_recorded_without_a_change_or_a_body_hash(keys):
+    _keydir, dns = keys
+    arrived = post(keys)
+    # only fields DKIM2 does not hash were touched
+    seen = dkim2hop.stream(arrived, BODY, "alice@example.com", [LIST], dns)
+    assert dkim2hop.record(seen, arrived + fields(("X-Spam", "no"))).reason == "no hashed header field changed"
+    # the body went by unhashed: there is nothing to put in h=
+    plain = fields(("From", "a@example.com"), ("To", LIST))
+    changed = fields(("From", "a@example.com"), ("To", "someone@example.net"))
+    unhashed = dkim2hop.stream(plain, BODY, "a@example.com", [LIST], dns, may_sign=False)
+    assert dkim2hop.record(unhashed, changed).reason == "the body was not hashed"
+
+
 # --- refusals ---------------------------------------------------------------------
 
 def test_no_key_no_signature(keys):

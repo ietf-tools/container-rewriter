@@ -36,9 +36,9 @@ set:
 
 - does nothing if the arrival verdict was `fail`, `permerror` or
   `temperror`;
-- adds a `Message-Instance` recording the header fields the rewriter itself
-  changed, with a Recipe that restores them, if the message already has
-  `Message-Instance` fields (signed or not); or `m=1` if it has none;
+- records the header fields the rewriter itself changed in a
+  `Message-Instance`, with a Recipe that restores them (below); a message
+  it did not change, with no `Message-Instance`, gets `m=1`;
 - adds a `DKIM2-Signature` naming the envelope the message leaves in. It
   covers every instance below it, so one signature answers for mailman's
   unsigned instance and the rewriter's own (see "The trusted path"). Every
@@ -49,6 +49,27 @@ set:
 It does not sign, and logs why, when: there is no key for the envelope
 sender's domain; the envelope sender is null (bounces); the chain already on
 the message does not verify; or From is not in the signing domain.
+
+**Whenever it changes a hashed header field**, signing or not, with either
+setting on, the rewriter says so in `Message-Instance` fields. Its header
+changes apply to every copy of a message, including ones it will not sign:
+To and Cc are shown unwrapped on a reply to a wrapped address whether or
+not anything makes it take the envelope over; From is wrapped for an alias,
+which is a local recipient; the chain may have failed on arrival; there may
+be no key directory at all. In each case the change is recorded:
+
+- a message that has `Message-Instance` fields gets the next one, with the
+  Recipe that undoes the change;
+- a message with none gets `m=1` for the message as it was handed over and
+  `m=2` with the Recipe.
+
+When the rewriter signs, its signature covers them. When it does not, they
+stay on the message unsigned. The copy delivered to mailman then has a
+chain that describes it, and the fan-out signs over those instances along
+with mailman's and its own. A copy that leaves us with unsigned instances
+(the reply forwarded to the unwrapped address) will not verify at the next
+hop. It would not have with the change unrecorded either, and this way the
+message says what was done to it.
 
 ## What it relies on
 
@@ -102,7 +123,8 @@ the rewriter verified it as it came in, mailman received it from us, and
 mailman hands the copies back over an authenticated connection. So when
 the arrival verdict was `pass` or `none`, the `Message-Instance` fields
 nobody has signed yet are ours to answer for, whichever of our components
-wrote them. The rewriter keeps them, adds its own as the next one, and
+wrote them: the rewriter on arrival (above), or mailman. The rewriter keeps
+them, adds its own as the next one, and
 signs once over all of them. That holds when the signature is the first on
 the message too: a post nobody signed, which mailman gave an `m=1`, leaves
 with mailman's `m=1`, the rewriter's `m=2` and `i=1; m=2`.
@@ -234,8 +256,11 @@ with the Secret holding one item named `<selector>.key`.
 With DKIM2 configured the rewriter is sent the message body, which it was
 not before. It does not keep it: the body is hashed, and the chain it
 arrived with verified, as each piece comes in. A message with no
-`Message-Instance` that will not be relayed off-site (ordinary mail arriving
-for a list) is not hashed at all: nothing needs its body. Memory per transaction is the
+`Message-Instance` that will not be relayed off-site and is not for an
+alias (ordinary mail arriving for a list) is not hashed at all: the
+rewriter does not change it, so nothing needs its body. Telling an alias
+from a list is one more database lookup, when the header fields have
+arrived, for mail with no off-site recipient. Memory per transaction is the
 header fields plus about 130 KB of working space, whatever the size of the
 message. CPU is one pass over the body: on a 2026 laptop core, about 3 ms
 per megabyte, plus under a millisecond to verify one signature or to sign.
@@ -258,7 +283,8 @@ at all (pymilter's `nocallback`), as before.
 1. Deploy with nothing set. Nothing changes.
 2. Set `DKIM2_AUTHSERV_ID`. Watch the log for `dkim2: arrival <result>` and
    check `Authentication-Results` on delivered mail. Almost everything will
-   be `none` until senders sign.
+   be `none` until senders sign. From this step on, a message whose To, Cc
+   or From the rewriter changes gets `Message-Instance` fields saying so.
 3. Publish the key record, mount the key, set `DKIM2_KEYDIR` and
    `DKIM2_SELECTOR`. Watch for `dkim2: signed d=…` and `dkim2: not signing:
    <reason>`.
