@@ -1,0 +1,1415 @@
+#!/usr/bin/env python3
+"""
+DKIM2 signer - draft-ietf-dkim-dkim2-spec-09
+
+Takes a raw email, selector, domain, and keyfile and produces a signed
+message with Message-Instance and DKIM2-Signature headers on stdout.
+"""
+
+import argparse
+import base64
+import hashlib
+import io
+import json
+import os
+import re
+import sys
+import time
+import warnings
+from array import array
+from pathlib import Path
+from typing import IO, Union
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa, utils
+
+from dkim2domain import (FROM_OK, from_mailbox, relaxed_match,
+                         signing_domain, to_alabel)
+
+
+# Source can be raw bytes, a file path (str/Path), or any binary-mode file-like object.
+Source = Union[bytes, str, "Path", "IO[bytes]"]
+
+
+def _to_bytes(source: "Source") -> bytes:
+    """Normalize any message source to bytes."""
+    if isinstance(source, bytes):
+        return source
+    if isinstance(source, (str, Path)):
+        return Path(source).read_bytes()
+    return source.read()
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def b64(data: bytes) -> str:
+    """Base64-encode bytes, return str with no newlines."""
+    return base64.b64encode(data).decode("ascii")
+
+
+def b64json(obj) -> str:
+    """JSON-encode an object, then base64-encode the result."""
+    return b64(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+
+
+def to_rfc5321_path(addr: str) -> str:
+    """Wrap an address as an RFC5321 path for mf=/rt= (-09 §10.5/§10.6):
+    angle brackets MUST be present. Empty -> '<>'.  A non-ASCII domain is
+    recorded as its A-label (§18); the local part and an ASCII or literal
+    domain are left exactly as given."""
+    if not addr:
+        return "<>"
+    inner = addr[1:-1] if addr.startswith("<") and addr.endswith(">") else addr
+    at = inner.rfind("@")
+    if at >= 0:
+        domain = inner[at + 1:]
+        if not domain.isascii() and not domain.startswith("["):
+            inner = inner[:at + 1] + to_alabel(domain)
+    return f"<{inner}>"
+
+
+# ---------------------------------------------------------------------------
+# Parse raw message into (header_lines, body)
+# ---------------------------------------------------------------------------
+
+def parse_message(source: "Source") -> tuple[list[bytes], bytes]:
+    """Split a raw RFC 5322 message into header lines and body.
+
+    Returns (headers, body) where headers is a list of complete header
+    fields (including continuation lines) as raw bytes, and body is the
+    raw body bytes (everything after the blank line separator).
+    """
+    raw = _to_bytes(source)
+    # Normalise line endings to CRLF
+    raw = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+
+    # Split at first blank line
+    sep = b"\r\n\r\n"
+    idx = raw.find(sep)
+    if idx == -1:
+        header_block = raw
+        body = b""
+    else:
+        header_block = raw[:idx]
+        body = raw[idx + len(sep):]
+
+    # Split header block into individual header fields (handling continuations)
+    header_lines: list[bytes] = []
+    for line in header_block.split(b"\r\n"):
+        if line and line[0:1] in (b" ", b"\t") and header_lines:
+            # Continuation line – append to previous header
+            header_lines[-1] += b"\r\n" + line
+        else:
+            if line:
+                header_lines.append(line)
+
+    return header_lines, body
+
+
+# ---------------------------------------------------------------------------
+# Canonicalization for header hash (Section 6.2)
+# ---------------------------------------------------------------------------
+
+# Headers to exclude from the header hash (-09 §4, §4.1).  -08 took
+# Auto-Submitted and VBR-Info off the list: they are hashed (contract D1).
+_EXCLUDED_PREFIXES = (b"x-", b"received-")
+_EXCLUDED_NAMES = {
+    b"apparently-to", b"arc-authentication-results",
+    b"arc-message-signature", b"arc-seal", b"authentication-results",
+    b"delivered-to", b"dkim-signature",
+    b"dkim2-signature", b"dl-expansion-history", b"message-instance",
+    b"original-recipient", b"received", b"return-path",
+    b"sio-label-history", b"x400-received", b"x400-trace",
+}
+
+
+def _header_name(hdr: bytes) -> bytes:
+    """Extract the field name from a raw header line (before the colon)."""
+    colon = hdr.find(b":")
+    if colon == -1:
+        return hdr.strip().lower()
+    return hdr[:colon].strip().lower()
+
+
+def _should_exclude_header(name: bytes) -> bool:
+    """Return True if this header should be excluded from the header hash."""
+    if name in _EXCLUDED_NAMES:
+        return True
+    for prefix in _EXCLUDED_PREFIXES:
+        if name.startswith(prefix):
+            return True
+    return False
+
+
+def canonicalize_header_field(raw_hdr: bytes) -> bytes:
+    """Canonicalize a single header field per Section 6.2 steps 2-6.
+
+    Input is a raw header field (may include continuation lines).
+    Returns the canonicalized form (name:value without trailing CRLF).
+    """
+    # Decode to str for easier manipulation
+    hdr = raw_hdr.decode("utf-8", errors="surrogateescape")
+
+    # Step 3: Unfold continuation lines (remove CRLF before WSP)
+    hdr = re.sub(r"\r\n([ \t])", r"\1", hdr)
+
+    # Split into name and value at first colon
+    colon = hdr.find(":")
+    if colon == -1:
+        name = hdr
+        value = ""
+    else:
+        name = hdr[:colon]
+        value = hdr[colon + 1:]
+
+    # Step 2: Lowercase the field name
+    name = name.lower()
+
+    # Step 4: Convert all WSP sequences to single SP
+    name = re.sub(r"[ \t]+", " ", name).strip()
+    value = re.sub(r"[ \t]+", " ", value)
+
+    # Step 5: Delete WSP at end of value
+    value = value.rstrip(" \t")
+
+    # Step 6: Delete WSP before and after colon (i.e. trim name and value)
+    name = name.strip()
+    value = value.lstrip(" \t")
+
+    return (name + ":" + value).encode("utf-8", errors="surrogateescape")
+
+
+# -09 §3.1: two hashing algorithms are defined. Verifiers MUST implement
+# both; Signers MAY implement either or both (we default to sha256).
+HASH_ALGS = {
+    "sha256": lambda data: hashlib.sha256(data).digest(),
+    "sha512": lambda data: hashlib.sha512(data).digest(),
+}
+
+
+def _digest(data: bytes, alg: str = "sha256") -> bytes:
+    try:
+        return HASH_ALGS[alg](data)
+    except KeyError:
+        raise ValueError(f"unsupported hash algorithm: {alg}")
+
+
+def compute_header_hash(headers: list[bytes], alg: str = "sha256") -> bytes:
+    """Compute the hash of canonicalized, sorted headers (Section 6.2).
+
+    Excludes headers listed in the spec. Returns raw digest bytes.
+    """
+    canon_headers: list[tuple[bytes, bytes]] = []
+
+    for hdr in headers:
+        name = _header_name(hdr)
+        if _should_exclude_header(name):
+            continue
+        canon = canonicalize_header_field(hdr)
+        canon_headers.append((name, canon))
+
+    # Step 7-8: Sort alphabetically by name; duplicate names are ordered
+    # bottom-up (last occurrence first), matching Recipe numbering.
+    # Reverse before sorting so Python's stable sort preserves bottom-up order.
+    canon_headers.reverse()
+    canon_headers.sort(key=lambda x: x[0])
+
+    # Concatenate with CRLF separators and a trailing CRLF
+    data = b"\r\n".join(ch for _, ch in canon_headers)
+    if data:
+        data += b"\r\n"
+
+    return _digest(data, alg)
+
+
+# ---------------------------------------------------------------------------
+# Canonicalization for body hash (Section 6.1)
+# ---------------------------------------------------------------------------
+
+def compute_body_hash(body: bytes, alg: str = "sha256") -> bytes:
+    """Compute the hash of the canonicalized body (Section 6.1).
+
+    Simple canonicalization:
+    - Strip all trailing empty lines
+    - Ensure body ends with exactly one CRLF
+    """
+    # Normalise line endings
+    body = body.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+
+    # Remove all trailing CRLF sequences (empty lines at end)
+    while body.endswith(b"\r\n"):
+        body = body[:-2]
+
+    # Add exactly one trailing CRLF (even if body was empty)
+    body += b"\r\n"
+
+    return _digest(body, alg)
+
+
+class BodyHasher:
+    """compute_body_hash() for a body that arrives in pieces.
+
+    feed() the body's octets as they come, cut anywhere; digest(alg) is then
+    what compute_body_hash(body, alg) gives for the whole.  Nothing of the
+    body is kept beyond the hash state and a count of line breaks that may
+    yet turn out to be the trailing empty lines Section 6.1 drops.
+    """
+
+    def __init__(self, algs=("sha256",)):
+        self._hashes = {alg: hashlib.new(alg) for alg in algs}
+        self._carry = b""      # a CR that ended a piece: half of a CRLF?
+        self._held = 0         # line breaks seen since the last other octet
+
+    def feed(self, data: bytes) -> None:
+        data = self._carry + data
+        self._carry = b""
+        if data.endswith(b"\r"):
+            self._carry, data = b"\r", data[:-1]
+        if not data:
+            return
+        data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+        kept = len(data)
+        while kept >= 2 and data[kept - 2:kept] == b"\r\n":
+            kept -= 2
+        trailing = (len(data) - kept) // 2
+        if kept == 0:
+            self._held += trailing
+            return
+        for h in self._hashes.values():
+            h.update(b"\r\n" * self._held)
+            h.update(data[:kept] if trailing else data)
+        self._held = trailing
+
+    def digest(self, alg: str = "sha256") -> bytes:
+        """The hash so far, as if the body ended here.  More may be fed."""
+        h = self._hashes[alg].copy()
+        # held line breaks (and a lone CR) are trailing empty lines: dropped
+        h.update(b"\r\n")
+        return h.digest()
+
+    def digests(self) -> dict:
+        return {alg: self.digest(alg) for alg in self._hashes}
+
+
+# ---------------------------------------------------------------------------
+# Build Message-Instance header
+# ---------------------------------------------------------------------------
+
+def build_message_instance(headers: list[bytes], body: bytes,
+                           version: int = 1, recipe: dict | None = None,
+                           algs: list[str] | None = None) -> str:
+    """Build a Message-Instance header field value.
+
+    Returns the complete header as a string (including field name).
+    Trailing semicolon is included per spec ABNF (tag-list grammar).
+    """
+    if algs is None:
+        algs = ["sha256"]
+    return build_message_instance_from_hashes(
+        headers, {alg: compute_body_hash(body, alg) for alg in algs},
+        version=version, recipe=recipe)
+
+
+def build_message_instance_from_hashes(headers: list[bytes],
+                                       body_hashes: dict,
+                                       version: int = 1,
+                                       recipe: dict | None = None) -> str:
+    """build_message_instance() for a caller that has hashed the body
+    already (BodyHasher): body_hashes maps each algorithm to the raw digest
+    compute_body_hash() gives, in the order they go into h=."""
+    # -09 §9.3: one hash-set per algorithm, comma separated. An algorithm
+    # MUST NOT appear more than once, so the algorithms must be
+    # de-duplicated by the caller (the CLI does this).
+    sets = ",".join(
+        f"{alg}:{b64(compute_header_hash(headers, alg))}:{b64(body_hash)}"
+        for alg, body_hash in body_hashes.items()
+    )
+    value = f"m={version}; h={sets}"
+    if recipe is not None:
+        value += f"; r={b64json(_lowercase_recipe_keys(recipe))}"
+    value += ";"
+    return f"Message-Instance: {value}"
+
+
+def _lowercase_recipe_keys(recipe):
+    """Every JSON object key in a Recipe, lowercased, for output.
+
+    draft -09 §5: keys MUST be lower case -- the top-level "h"/"b", the
+    header field names inside "h" (matching against the message stays
+    case-insensitive), and the step keys.  Values are left alone.
+    """
+    if isinstance(recipe, dict):
+        return {k.lower() if isinstance(k, str) else k: _lowercase_recipe_keys(v)
+                for k, v in recipe.items()}
+    if isinstance(recipe, list):
+        return [_lowercase_recipe_keys(v) for v in recipe]
+    return recipe
+
+
+# ---------------------------------------------------------------------------
+# Recipe generation (Section 5)
+# ---------------------------------------------------------------------------
+#
+# An intermediary that changes a message records how to get the previous
+# version back (draft -09 §5.1/§5.2).  A literal that is valid UTF-8 (ASCII
+# included) goes out as a "d" string; any other literal -- a Latin-1 or
+# EUC-KR line, say, which JSON text cannot carry -- as a "u" item, the
+# canonical base64 of its raw octets.
+
+def _utf8_text(v: bytes) -> str | None:
+    try:
+        return v.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def recipe_literal_steps(values: list[bytes]) -> list[dict]:
+    """Turn literal lines/values into "d"/"u" steps.
+
+    Consecutive literals of the same kind coalesce into one step; a mixed
+    run alternates "d" and "u" steps in order.  A literal may not contain
+    CR or LF (§5.1/§5.2) -- a folded header value must be unfolded first.
+    """
+    steps: list[dict] = []
+    for v in values:
+        if b"\r" in v or b"\n" in v:
+            raise ValueError("Recipe literal contains CR or LF")
+        text = _utf8_text(v)
+        if text is not None:
+            kind, item = "d", text
+        else:
+            kind, item = "u", b64(v)
+        if steps and kind in steps[-1]:
+            steps[-1][kind].append(item)
+        else:
+            steps.append({kind: [item]})
+    return steps
+
+
+def _recipe_steps(current: list, previous: list, keys, literal) -> list[dict]:
+    """Steps that rebuild `previous` from `current`, both in Recipe order.
+
+    `keys(x)` gives the comparison form of an item (equal keys mean a copy
+    is hash-equivalent); `literal(x)` gives the octets to emit when an item
+    must be written out.  Alignment is the same capped Myers diff as body
+    Recipes (body_diff below): O((N+M)D), so a long run of identical,
+    sender-controlled fields with a few changes stays linear.  Matched runs
+    become "c" ranges; the diff is monotone, so every "c" start is greater
+    than the previous "c" end (§5.1/§5.2).  An item of `previous` that does
+    not match anything after the last copied item -- a reordered duplicate,
+    say -- is emitted literally rather than as an out-of-order range.
+
+    Header Recipes cannot be null, so there is no literal cap; if the diff
+    exceeds MAX_DIFF_WORK every previous item is written out literally.
+    """
+    cur_keys = [keys(x) for x in current]
+    prev_keys = [keys(x) for x in previous]
+    flat = body_diff(cur_keys, prev_keys, max_literals=len(prev_keys))
+    if flat is BODY_DIFF_IDENTICAL:
+        return [{"c": [1, len(current)]}] if current else []
+    if flat is BODY_DIFF_TOO_BIG:
+        return recipe_literal_steps([literal(x) for x in previous])
+    steps: list[dict] = []
+    pending: list[bytes] = []
+    j = 0                           # index into `previous`
+    for item in flat:
+        if isinstance(item, list):
+            if pending:
+                steps.extend(recipe_literal_steps(pending))
+                pending.clear()
+            steps.append({"c": item})
+            j += item[1] - item[0] + 1
+        else:
+            pending.append(literal(previous[j]))
+            j += 1
+    if pending:
+        steps.extend(recipe_literal_steps(pending))
+    return steps
+
+
+def _header_field_value(hdr: bytes) -> bytes:
+    """The value after the colon, unfolded, without the trailing CRLF."""
+    hdr = re.sub(rb"\r\n([ \t])", rb"\1", hdr.rstrip(b"\r\n"))
+    colon = hdr.find(b":")
+    return hdr[colon + 1:] if colon != -1 else b""
+
+
+def build_header_recipe(previous: list[bytes], current: list[bytes]) -> list[dict]:
+    """Recipe steps for one header field name (§5.1).
+
+    Both lists hold the raw instances of that name in top-to-bottom message
+    order.  Instances are numbered bottom-up and steps are emitted bottom-up,
+    so both are reversed before alignment.  Two instances match when their
+    §6.2 canonical forms are equal.
+    """
+    return _recipe_steps(list(reversed(current)), list(reversed(previous)),
+                         canonicalize_header_field, _header_field_value)
+
+
+def _body_lines(body: bytes) -> list[bytes]:
+    body = body.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    lines = body.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Capped Myers body diff (docs/superpowers/specs/2026-10-09-capped-myers-
+# body-diff-design.md, "Exact pseudocode (normative for every port)")
+# ---------------------------------------------------------------------------
+#
+# Every implementation runs the same algorithm with the same tie-break so
+# they all produce identical body recipes (vectors/body-diff.json).  The
+# literal cap and the work budget bound CPU and memory; over either, the
+# caller emits the null body Recipe instead.
+
+MAX_RECIPE_LITERALS = 1000
+MAX_DIFF_WORK = 4_000_000
+
+
+class _DiffResult:
+    __slots__ = ("name",)
+
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return self.name
+
+
+BODY_DIFF_IDENTICAL = _DiffResult("BODY_DIFF_IDENTICAL")
+BODY_DIFF_TOO_BIG = _DiffResult("BODY_DIFF_TOO_BIG")
+
+
+def body_diff(cur: list, prev: list, max_literals: int = MAX_RECIPE_LITERALS):
+    """Steps that rebuild `prev` from `cur`, or a sentinel.
+
+    Returns BODY_DIFF_IDENTICAL when the line lists are equal,
+    BODY_DIFF_TOO_BIG when the recipe would need more than `max_literals`
+    literal lines or the search exceeds MAX_DIFF_WORK, otherwise a flat list
+    whose items are [from, to] (1-based inclusive copy ranges into `cur`) or
+    a literal line from `prev`.
+    """
+    C, P, L = len(cur), len(prev), max_literals
+    pre = 0
+    while pre < C and pre < P and cur[pre] == prev[pre]:
+        pre += 1
+    if pre == C and pre == P:
+        return BODY_DIFF_IDENTICAL
+    suf = 0
+    while suf < C - pre and suf < P - pre and cur[C - 1 - suf] == prev[P - 1 - suf]:
+        suf += 1
+    a = cur[pre:C - suf]
+    b = prev[pre:P - suf]
+
+    cnt_a: dict = {}
+    for line in a:
+        cnt_a[line] = cnt_a.get(line, 0) + 1
+    cnt_b: dict = {}
+    for line in b:
+        cnt_b[line] = cnt_b.get(line, 0) + 1
+
+    ids: dict = {}
+    A: list[int] = []
+    ai: list[int] = []
+    for i, line in enumerate(a):
+        if line in cnt_b:
+            A.append(ids.setdefault(line, len(ids)))
+            ai.append(i)
+    B: list[int] = []
+    bj: list[int] = []
+    for j, line in enumerate(b):
+        if line in cnt_a:
+            B.append(ids.setdefault(line, len(ids)))
+            bj.append(j)
+    N, M = len(A), len(B)
+    u = len(b) - M
+    floor = u
+    for line, nb in cnt_b.items():
+        na = cnt_a.get(line, 0)
+        if na > 0 and nb > na:
+            floor += nb - na
+    if floor > L:
+        return BODY_DIFF_TOO_BIG
+
+    match = [-1] * M
+    if N > 0 and M > 0:
+        dmax = N - M + 2 * (L - u)
+        if dmax > N + M:
+            dmax = N + M
+        if dmax < 0:
+            return BODY_DIFF_TOO_BIG
+        off = dmax + 1                    # V[k] lives at V[k + off]
+        V = [0] * (2 * dmax + 3)
+        trace: list = []
+        work = 0
+        found = -1
+        for d in range(dmax + 1):
+            # Only k in [-d-1, d+1] is ever read back; T[k] is at T[k + d + 1].
+            trace.append(array("l", V[off - d - 1:off + d + 2]))
+            for k in range(-d, d + 1, 2):
+                kk = k + off
+                if k == -d or (k != d and V[kk - 1] < V[kk + 1]):
+                    x = V[kk + 1]                       # down
+                else:
+                    x = V[kk - 1] + 1                   # right
+                y = x - k
+                if x < N and y < M and A[x] == B[y]:
+                    x0 = x
+                    while x < N and y < M and A[x] == B[y]:
+                        x += 1
+                        y += 1
+                    work += x - x0
+                V[kk] = x
+                work += 1
+                if work > MAX_DIFF_WORK:
+                    return BODY_DIFF_TOO_BIG
+                if x == N and y == M:
+                    found = d
+                    break
+            if found >= 0:
+                break
+        if found < 0:
+            return BODY_DIFF_TOO_BIG
+
+        x, y = N, M
+        for d in range(found, 0, -1):
+            T = trace[d]
+            o = d + 1
+            k = x - y
+            down = k == -d or (k != d and T[k - 1 + o] < T[k + 1 + o])
+            pk = k + 1 if down else k - 1
+            px = T[pk + o]
+            py = px - pk
+            if down:
+                sx = px
+            else:
+                sx = px + 1
+            while x > sx:
+                x -= 1
+                y -= 1
+                match[y] = x
+            x, y = px, py
+        while x > 0:
+            x -= 1
+            y -= 1
+            match[y] = x
+
+    # src[j] for the middle previous lines: index into cur, or -1.
+    mid_src = [-1] * len(b)
+    for y in range(M):
+        if match[y] >= 0:
+            mid_src[bj[y]] = pre + ai[match[y]]
+
+    recipe: list = []
+    literals = 0
+    shift = C - P
+    for j in range(P):
+        if j < pre:
+            i = j
+        elif j >= P - suf:
+            i = j + shift
+        else:
+            i = mid_src[j - pre]
+        if i < 0:
+            recipe.append(prev[j])
+            literals += 1
+        elif recipe and isinstance(recipe[-1], list) and recipe[-1][1] == i:
+            recipe[-1][1] = i + 1
+        else:
+            recipe.append([i + 1, i + 1])
+    if literals > L:
+        return BODY_DIFF_TOO_BIG
+    return recipe
+
+
+def build_body_recipe(previous: bytes, current: bytes, *,
+                      max_literals: int = MAX_RECIPE_LITERALS) -> list[dict] | None:
+    """Recipe steps that rebuild the previous body from the current one (§5.2).
+
+    Uses the capped Myers diff above.  Returns None -- the null body Recipe,
+    "b": null on the wire -- when the recipe would exceed
+    `max_literals` literal lines (default MAX_RECIPE_LITERALS) or the diff
+    exceeds MAX_DIFF_WORK.
+    """
+    cur = _body_lines(current)
+    flat = body_diff(cur, _body_lines(previous), max_literals)
+    if flat is BODY_DIFF_TOO_BIG:
+        return None
+    if flat is BODY_DIFF_IDENTICAL:
+        # Same lines but different octets (line endings, say): copy it all.
+        return [{"c": [1, len(cur)]}] if cur else []
+    steps: list[dict] = []
+    pending: list[bytes] = []
+    for item in flat:
+        if isinstance(item, list):
+            if pending:
+                steps.extend(recipe_literal_steps(pending))
+                pending.clear()
+            steps.append({"c": item})
+        else:
+            pending.append(item)
+    if pending:
+        steps.extend(recipe_literal_steps(pending))
+    return steps
+
+
+def build_recipes(previous_headers: list[bytes], previous_body: bytes,
+                  current_headers: list[bytes], current_body: bytes, *,
+                  max_literals: int = MAX_RECIPE_LITERALS) -> dict | None:
+    """The r= object for a hop that turned (previous_*) into (current_*).
+
+    Only header field names whose instances changed get an "h" entry (an
+    empty list where the name is new); "b" is present only if the body
+    changed -- JSON null (the null body Recipe) when the body diff is over
+    the literal cap (`max_literals`) or work budget.  Header fields excluded from the hash
+    (§4) are never described.  Returns None when nothing relevant changed, so the caller omits r=.
+    """
+    def by_name(headers):
+        out: dict[bytes, list[bytes]] = {}
+        for hdr in headers:
+            out.setdefault(_header_name(hdr), []).append(hdr)
+        return out
+
+    prev_by, cur_by = by_name(previous_headers), by_name(current_headers)
+    h: dict[str, list] = {}
+    for name in sorted(set(prev_by) | set(cur_by)):
+        if _should_exclude_header(name):
+            continue
+        prev, cur = prev_by.get(name, []), cur_by.get(name, [])
+        if ([canonicalize_header_field(x) for x in prev]
+                == [canonicalize_header_field(x) for x in cur]):
+            continue
+        h[name.decode("ascii")] = build_header_recipe(prev, cur)
+
+    recipes: dict = {}
+    if h:
+        recipes["h"] = h
+    if compute_body_hash(previous_body) != compute_body_hash(current_body):
+        recipes["b"] = build_body_recipe(previous_body, current_body,
+                                         max_literals=max_literals)
+    return recipes or None
+
+
+# ---------------------------------------------------------------------------
+# Signature computation (Section 12.8)
+# ---------------------------------------------------------------------------
+
+def canonicalize_sig_header(raw_hdr: str) -> bytes:
+    """Canonicalize a Message-Instance or DKIM2-Signature header for signing.
+
+    Per Section 12.8: same as header hash except ALL WSP is deleted
+    (not collapsed to single SP).
+    """
+    hdr = raw_hdr if isinstance(raw_hdr, str) else raw_hdr.decode("utf-8", errors="surrogateescape")
+    # Step 3: Unfold continuation lines
+    hdr = re.sub(r"\r\n([ \t])", r"\1", hdr)
+    # Split into name and value at first colon
+    colon = hdr.find(":")
+    if colon == -1:
+        name = hdr
+        value = ""
+    else:
+        name = hdr[:colon]
+        value = hdr[colon + 1:]
+    # Step 2: Lowercase the field name
+    name = name.lower().strip()
+    # Step 3 (sig-specific): Delete ALL WSP characters
+    value = re.sub(r"[ \t]+", "", value)
+    # Strip trailing CRLF/LF
+    value = value.rstrip("\r\n")
+    return (name + ":" + value + "\r\n").encode("utf-8", errors="surrogateescape")
+
+
+def _extract_tag(header_value: str, tag: str) -> str | None:
+    """Extract a tag value from a DKIM2-style tag-list header value.
+
+    -09 §8, §9, §10: tag names are case-sensitive and MUST be lower case,
+    so a tag is matched exactly; "M=1" is an unknown tag, ignored (contract
+    D10, reversing -07 decision 2).  FWS is permitted around the '=' and ';'
+    separators.
+    """
+    for part in header_value.split(";"):
+        if "=" not in part:
+            continue
+        name, val = part.split("=", 1)
+        if name.strip() == tag:
+            return val.strip()
+    return None
+
+
+def _tag_names(header_value: str) -> list[str]:
+    """Tag names in a tag-list value, in order, exactly as written (for
+    duplicate detection per -09 §8: 'Tags with duplicate names MUST NOT
+    occur'; "m" and "M" are different tags, contract D10)."""
+    names = []
+    for part in header_value.split(";"):
+        if "=" in part:
+            names.append(part.split("=", 1)[0].strip())
+    return names
+
+
+def _get_version_from_mi(hdr: str) -> int:
+    """Extract m= value from a Message-Instance header string."""
+    # hdr is "Message-Instance: m=N; ..."
+    colon = hdr.find(":")
+    value = hdr[colon + 1:] if colon != -1 else hdr
+    m = _extract_tag(value, "m")
+    return _chain_int(m)
+
+
+def _mi_hashes(hdr: str) -> str | None:
+    """Extract the h= hash set of a Message-Instance header, FWS removed.
+
+    Folding whitespace may appear inside the base64 hashes (-09 §2.12), so
+    strip it before comparing two instances' hashes.
+    """
+    colon = hdr.find(":")
+    value = hdr[colon + 1:] if colon != -1 else hdr
+    h = _extract_tag(value, "h")
+    if h is None:
+        return None
+    return "".join(h.split())
+
+
+def _get_seq_from_sig(hdr: str) -> int:
+    """Extract i= value from a DKIM2-Signature header string.
+
+    0 when i= is missing or not a positive integer (ASCII digits): such a
+    signature cannot be keyed, and verify_message() reports it as a
+    PERMERROR (see _sig_has_valid_i)."""
+    colon = hdr.find(":")
+    value = hdr[colon + 1:] if colon != -1 else hdr
+    return _chain_int(_extract_tag(value, "i"))
+
+
+# Every i= and m= names one hop, and a chain has at most this many.
+MAX_CHAIN_LENGTH = 32
+# The largest number an i= or m= may be written as (at most two digits).
+MAX_CHAIN_NUMBER = 99
+
+
+def _is_ascii_digits(v: str) -> bool:
+    # str.isdigit() and int() also take "0_1", " 1", "\uff11" and "\u00b9".
+    return re.fullmatch(r"[0-9]+", v) is not None
+
+
+def _chain_int(v: str | None) -> int:
+    """An i=/m= value as a number, or 0 when it is missing or not 1*DIGIT
+    within MAX_CHAIN_NUMBER (chain_number_error says why). Never raises and
+    never returns a number big enough to be a loop bound."""
+    if v is None or not _is_ascii_digits(v) or len(v) > 2:
+        return 0
+    return int(v)
+
+
+def chain_number_error(field: str, tag: str, v: str | None,
+                       ident: str | None = None) -> str | None:
+    """The PERMERROR for an i= or m= value that is not a chain number, or
+    None (also for a missing value, which is left to the callers).
+
+    1*DIGIT in ASCII, else a syntax error (also zero); at most two digits
+    and 1..MAX_CHAIN_NUMBER, so "01" is 1; and no more than
+    MAX_CHAIN_LENGTH, since each number names one hop.  The field is named by
+    its own number (a DKIM2-Signature by i=, a Message-Instance by m=, -09
+    §14.2): `ident` is that value as written, defaulting to `v`."""
+    if v is None:
+        return None
+    v = v.strip()
+    ident_tag = "m" if field == "Message-Instance" else "i"
+    who = f"{field} {ident_tag}={v if ident is None else ident.strip()}"
+    # Length before int(): int() refuses more than 4300 digits.
+    if not _is_ascii_digits(v) or not v.strip("0"):
+        return f"PERMERROR: {who} syntax error"
+    if tag != ident_tag:
+        who += f" {tag}={v}"
+    if len(v) > 2 or int(v) > MAX_CHAIN_NUMBER:
+        return (f"PERMERROR: {who} exceeds the maximum chain "
+                f"number of {MAX_CHAIN_NUMBER}")
+    if int(v) > MAX_CHAIN_LENGTH:
+        return (f"PERMERROR: {who} exceeds the maximum chain "
+                f"length of {MAX_CHAIN_LENGTH}")
+    return None
+
+
+def _tag_of(hdr: str, tag: str) -> str | None:
+    colon = hdr.find(":")
+    return _extract_tag(hdr[colon + 1:] if colon != -1 else hdr, tag)
+
+
+def chain_range_error(mi_headers: list[str], sig_headers: list[str]) -> str | None:
+    """The PERMERROR for the first i= or m= that is not a chain number
+    (chain_number_error), or None. Checked before anything walks 1..max for
+    gaps."""
+    for field, tag, hdrs in (("DKIM2-Signature", "i", sig_headers),
+                             ("DKIM2-Signature", "m", sig_headers),
+                             ("Message-Instance", "m", mi_headers)):
+        for h in hdrs:
+            ident = _tag_of(h, "m" if field == "Message-Instance" else "i")
+            e = chain_number_error(field, tag, _tag_of(h, tag), ident)
+            if e:
+                return e
+    return None
+
+
+def _sig_has_valid_i(hdr: str) -> bool:
+    """True iff the DKIM2-Signature has an i= that is a positive integer in
+    ASCII digits (of any size: one above MAX_CHAIN_NUMBER is keyable but out
+    of range, which chain_range_error reports)."""
+    v = _tag_of(hdr, "i")
+    return v is not None and _is_ascii_digits(v) and bool(v.strip("0"))
+
+
+def _get_mi_from_sig(hdr: str) -> int | None:
+    """Extract m= (the Message-Instance it covers) from a DKIM2-Signature."""
+    colon = hdr.find(":")
+    value = hdr[colon + 1:] if colon != -1 else hdr
+    v = _extract_tag(value, "m")
+    return _chain_int(v) or None
+
+
+def compute_signature(mi_headers: list[str], sig_headers: list[str],
+                      incomplete_sig: str, private_key, algorithm: str) -> bytes:
+    """Compute the DKIM2 signature over MI and DKIM2-Sig headers.
+
+    Args:
+        mi_headers: Existing Message-Instance headers (as full header strings)
+        sig_headers: Existing DKIM2-Signature headers (as full header strings)
+        incomplete_sig: The DKIM2-Signature being created, with s= tag empty
+        private_key: Private key object (RSA or Ed25519)
+        algorithm: "rsa" or "ed25519"
+
+    Returns:
+        Raw signature bytes.
+    """
+    # Per draft-ietf-dkim-dkim2-spec-09 Section 12.8:
+    # 1. All MI headers in ascending v= order
+    # 2. All prior DKIM2-Signature headers in ascending i= order
+    # 3. The incomplete DKIM2-Signature being created
+    ordered: list[str] = []
+    ordered.extend(sorted(mi_headers, key=_get_version_from_mi))
+    ordered.extend(sorted(sig_headers, key=_get_seq_from_sig))
+    ordered.append(incomplete_sig)
+
+    # Canonicalize each header; each already ends in CRLF per spec Section 12.8
+    canon = [canonicalize_sig_header(h) for h in ordered]
+    data = b"".join(canon)
+
+    # Hash with SHA-256
+    digest = hashlib.sha256(data).digest()
+
+    # Sign
+    if algorithm.startswith("ed25519"):
+        # Ed25519 signs the raw data (PureEdDSA), but the spec says
+        # "signs the hash" - so we sign the SHA-256 digest
+        return private_key.sign(digest)
+    elif algorithm.startswith("rsa"):
+        return private_key.sign(
+            digest,
+            padding.PKCS1v15(),
+            utils.Prehashed(hashes.SHA256()),
+        )
+    else:
+        raise ValueError(f"Unsupported algorithm: {algorithm}")
+
+
+# ---------------------------------------------------------------------------
+# Build DKIM2-Signature header
+# ---------------------------------------------------------------------------
+
+def build_dkim2_signature(mi_headers: list[str], sig_headers: list[str],
+                          new_mi: str | None, domain: str, selector: str,
+                          private_key, algorithm: str,
+                          mailfrom: str = "<>",
+                          rcptto: list[str] | None = None,
+                          seq: int = 1, mi_version: int = 1,
+                          timestamp: int | None = None,
+                          next_domain: str | None = None,
+                          flags: list[str] | None = None,
+                          exploded: bool = False) -> str:
+    """Build a complete DKIM2-Signature header.
+
+    If next_domain is given, the signature carries an nd= tag for an imaginary
+    forwarding hop (-09 §12.3) and omits mf=/rt=. Otherwise it carries
+    mf=/rt= as usual. Any flags are emitted as an f= tag (-09 §10.10).
+
+    -09 §12.5: above i=1, "exploded" is added when it was requested
+    (`exploded`) or rt= holds more than one address; at i=1 it MUST NOT be
+    set, so a request -- or a caller-supplied "exploded" flag -- is dropped.
+
+    Returns the full header string including field name.
+    """
+    if timestamp is None:
+        timestamp = int(time.time())
+
+    # -09 §12.3: an nd= hop carries nd= instead of mf=/rt=.
+    if next_domain:
+        chain = f"nd={next_domain}"
+    else:
+        mf_b64 = b64(to_rfc5321_path(mailfrom).encode("utf-8"))
+        rt_list = rcptto or ["unknown@example.com"]
+        rt_b64 = ",".join(b64(to_rfc5321_path(r).encode("utf-8")) for r in rt_list)
+        chain = f"mf={mf_b64}; rt={rt_b64}"
+
+    flags = [f for f in (flags or []) if not (seq == 1 and f == "exploded")]
+    if (seq > 1 and "exploded" not in flags
+            and (exploded or (not next_domain and len(rcptto or []) > 1))):
+        flags.append("exploded")
+    f_tag = f" f={','.join(flags)};" if flags else ""
+
+    # Build the incomplete signature header with sel:alg: (null/empty string per spec §12.8).
+    # Trailing semicolon included per spec ABNF (tag-list grammar).
+    incomplete = (
+        f"DKIM2-Signature: i={seq}; m={mi_version}; t={timestamp}; "
+        f"d={domain}; {chain}; s={selector}:{algorithm}:;{f_tag}"
+    )
+
+    # Collect all MI headers, including the new one if this hop created one
+    # (new_mi is None when the hop changed nothing and reuses the existing top
+    # instance — see sign_message).
+    all_mi = mi_headers + ([new_mi] if new_mi is not None else [])
+
+    # Compute signature
+    sig_bytes = compute_signature(all_mi, sig_headers, incomplete,
+                                 private_key, algorithm)
+
+    # Build s= tag: sel:alg:sig
+    s_complete = f"{selector}:{algorithm}:{b64(sig_bytes)}"
+
+    # Build the final header with the actual signature value
+    return (
+        f"DKIM2-Signature: i={seq}; m={mi_version}; t={timestamp}; "
+        f"d={domain}; {chain}; s={s_complete};{f_tag}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Key loading
+# ---------------------------------------------------------------------------
+
+def load_private_key(keyfile: str) -> tuple:
+    """Load a private key from a PEM file.
+
+    Returns (key_object, algorithm_string).
+    """
+    key_data = Path(keyfile).read_bytes()
+
+    key = serialization.load_pem_private_key(key_data, password=None)
+
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        return key, "ed25519-sha256"
+    elif isinstance(key, rsa.RSAPrivateKey):
+        return key, "rsa-sha256"
+    else:
+        raise ValueError(f"Unsupported key type: {type(key)}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+class SigningRefused(Exception):
+    """The signer gate refused to extend an existing DKIM2 chain."""
+
+
+def _verify_upstream(raw: bytes, existing_sig, dns_data: dict | None,
+                     skip_timestamp_check: bool):
+    """The verdict on the chain already on a message, for the signer's gate:
+    the verifier in outbound mode (an unsigned top Message-Instance is the
+    one we are about to cover)."""
+    import os
+    # dkim2verify imports this module, so import it lazily.
+    import dkim2verify
+
+    if dns_data is None and not existing_sig:
+        dns_data = {}   # nothing to verify a signature with; MI chain only
+    if dns_data is None:
+        path = os.environ.get("DKIM2_DNS_JSON")
+        if not path:
+            raise SigningRefused(
+                "not signing: cannot verify the upstream DKIM2 chain: no DNS "
+                "data: pass --dns-json or set DKIM2_DNS_JSON (the signer gate "
+                "does not look keys up in DNS)")
+        try:
+            dns_data = dkim2verify.load_dns_json(path)
+        except (OSError, ValueError) as e:
+            raise SigningRefused(f"not signing: cannot read keys from "
+                                 f"{path}: {e}")
+    return dkim2verify.verify_message(
+        raw, dns_data, full_chain=True,
+        skip_timestamp_check=skip_timestamp_check, allow_unsigned_mi=True)
+
+
+def _gate_upstream(result, existing_sig,
+                   signing_domain: str | None = None) -> None:
+    """Refuse (SigningRefused) unless the chain already on the message checks
+    out.  `result` is the verifier's verdict on it in outbound mode
+    (allow_unsigned_mi: an unsigned top Message-Instance is the one we are
+    about to cover), or None if nobody verified it.  A signature with m=k
+    covers instances 1..k; an instance above every valid signature's m= with
+    a null body Recipe is this hop's own and is signed over (-09, contract
+    E2: it will PERMERROR downstream regardless, but our header changes are
+    signed).  A null some upstream signature already covers fails
+    verification and is refused like any other broken upstream chain."""
+    # A top signature with nd= may only be extended by the domain it names.
+    if existing_sig:
+        top_sig = max(existing_sig, key=_get_seq_from_sig)
+        top_nd = _extract_tag(top_sig[top_sig.find(":") + 1:], "nd")
+        if top_nd and (signing_domain is None
+                       or top_nd.strip().lower() != signing_domain.lower()):
+            raise SigningRefused(
+                f"not signing: top signature nd={top_nd.strip()} names "
+                f"another domain")
+
+    if result is None:
+        raise SigningRefused(
+            "not signing: the upstream DKIM2 chain has not been verified")
+    if not result.ok:
+        detail = "; ".join(result.errors) or result.message
+        if any(("v=" in e or "ecipe" in e or "Message-Instance" in e)
+               and not e.endswith(" has a null recipe")
+               for e in result.errors) and result.status != "fail":
+            raise SigningRefused(
+                f"not signing: Message-Instance chain does not undo cleanly: "
+                f"{detail}")
+        raise SigningRefused(
+            f"not signing: upstream DKIM2 chain result={result.status} "
+            f"{detail}")
+
+    # -09 (contract E2): an unsigned instance's null body Recipe -- this
+    # host's own, above every valid signature -- is signed over (the
+    # verifier skips the null check for it in outbound mode); a null that
+    # arrived already signed failed the verification above ("has a null
+    # recipe") and was refused as a broken upstream chain.
+
+
+_warned_allow_null = False
+
+
+def _warn_allow_null_body_recipe() -> None:
+    """The deprecated allow_null_body_recipe / --allow-null-body-recipe was
+    set: say so once per process (contract E2)."""
+    global _warned_allow_null
+    if not _warned_allow_null:
+        _warned_allow_null = True
+        warnings.warn("allow_null_body_recipe is deprecated and does nothing: "
+                      "an unsigned null body Recipe is always signed over",
+                      DeprecationWarning, stacklevel=3)
+
+
+def _extract_mi_recipe(mi_hdr: str):
+    """Decoded r= object of a Message-Instance header, or None if absent."""
+    import dkim2verify
+    try:
+        return dkim2verify.decode_recipes(mi_hdr)
+    except (ValueError, TypeError):
+        return None
+
+
+def _from_needs_check(existing_mi: list[str], existing_sig: list[str]) -> bool:
+    """-09 §12.4: the signer chooses d= so From is Authentic when it signs
+    the original message (no DKIM2-Signature yet), or when From was changed
+    -- by a Message-Instance above the highest m= any signature covers,
+    whose header Recipe has a "from" key."""
+    if not existing_sig:
+        return True
+    covered = max((_get_mi_from_sig(s) or 0
+                   for s in existing_sig if _sig_has_valid_i(s)), default=0)
+    for mi in existing_mi:
+        if _get_version_from_mi(mi) <= covered:
+            continue
+        recipe = _extract_mi_recipe(mi)
+        h = recipe.get("h") if isinstance(recipe, dict) else None
+        if isinstance(h, dict) and "from" in h:
+            return True
+    return False
+
+
+def _from_refusal(from_fields: list[bytes], domain: str,
+                  parent_from) -> str | None:
+    """-09 §12.4, contract E3.4: None if the From is Authentic for d=domain,
+    else the refusal text.  The downward match signs; the upward match (d=
+    below the From domain) signs only when parent_from(from_domain) says
+    so.  No Domain Policy Record is looked up."""
+    refusal = f"From header field is not Authentic for d={domain}"
+    kind, dom = from_mailbox(from_fields)
+    if kind != FROM_OK:
+        return refusal
+    sd = signing_domain(domain)
+    if relaxed_match(dom, sd):          # downward
+        return None
+    if relaxed_match(sd, dom) and parent_from is not None \
+            and parent_from(dom):       # upward, allowed by the caller
+        return None
+    return refusal
+
+
+def parent_from_set(domains) -> "callable":
+    """A parent_from callable answering from a list of domains (case-
+    insensitive, one trailing dot ignored), as dkim2sign --parent-from."""
+    allowed = {to_alabel(d[:-1] if d.endswith(".") else d) for d in domains}
+    return lambda from_domain: from_domain in allowed
+
+
+def sign_message(source: "Source", selector: str, domain: str, keyfile: str,
+                 mailfrom: str = "<>", rcptto: list[str] | None = None,
+                 timestamp: int | None = None,
+                 next_domain: str | None = None,
+                 flags: list[str] | None = None,
+                 algs: list[str] | None = None,
+                 dns_data: dict | None = None,
+                 skip_timestamp_check: bool = False,
+                 allow_null_body_recipe: bool | None = None,
+                 skip_upstream_check: bool = False,
+                 exploded: bool = False,
+                 skip_from_check: bool = False,
+                 parent_from=None) -> bytes:
+    """Sign a raw email message with DKIM2.
+
+    A message that already carries a DKIM2 chain is verified first (outbound
+    mode: an unsigned top Message-Instance is allowed); if the chain does not
+    check out, SigningRefused is raised.  An unsigned instance with a null
+    body Recipe is signed over (-09, contract E2); one an upstream
+    signature covers fails the verification.  Keys come from dns_data, else
+    the dns.json named by $DKIM2_DNS_JSON.
+
+    allow_null_body_recipe is deprecated and does nothing (signing over our
+    own null is now the only behaviour); a true value warns once.
+
+    -09 §12.4: when the message is being signed for the first time, or a
+    Message-Instance no signature covers yet changed From, the From header
+    field must be Authentic for `domain`, or SigningRefused is raised with
+    "From header field is not Authentic for d=<domain>".  A From domain at
+    or below `domain` is signed; one above it (d= is a subdomain of the
+    From domain) is signed only when parent_from, a callable
+    parent_from(from_domain) -> bool given the From domain as a lowercase
+    A-label with no trailing dot, returns true (contract E3.4).  With no
+    parent_from that case is refused.  The signer looks no Domain Policy
+    Record up.
+
+    exploded=True asks for the "exploded" flag (-09 §12.5): it is set above
+    i=1 when requested or when rt= holds more than one address.
+
+    skip_upstream_check=True bypasses the gate entirely, and
+    skip_from_check=True the From check.  They exist for test and fixture
+    builders that must sign broken chains on purpose; there is deliberately
+    no CLI flag for either.
+
+    Returns the complete message with Message-Instance and DKIM2-Signature
+    headers prepended.
+    """
+    raw = _to_bytes(source)
+    headers, body = parse_message(raw)
+
+    existing_sig = [hdr.decode("utf-8", errors="surrogateescape")
+                    for hdr in headers if _header_name(hdr) == b"dkim2-signature"]
+    has_chain = existing_sig or any(
+        _header_name(hdr) == b"message-instance" for hdr in headers)
+
+    # The gate's verdict, when the numbers are sane enough to ask for one
+    # (sign_fields refuses the rest before it looks at this).
+    upstream = None
+    if has_chain and not skip_upstream_check and not chain_range_error(
+            [hdr.decode("utf-8", errors="surrogateescape") for hdr in headers
+             if _header_name(hdr) == b"message-instance"], existing_sig):
+        upstream = _verify_upstream(raw, existing_sig, dns_data,
+                                    skip_timestamp_check)
+
+    new_fields = sign_fields(
+        headers, {alg: compute_body_hash(body, alg) for alg in (algs or ["sha256"])},
+        selector, domain, keyfile,
+        mailfrom=mailfrom, rcptto=rcptto, timestamp=timestamp,
+        next_domain=next_domain, flags=flags, upstream=upstream,
+        allow_null_body_recipe=allow_null_body_recipe,
+        skip_upstream_check=skip_upstream_check, exploded=exploded,
+        skip_from_check=skip_from_check, parent_from=parent_from)
+
+    # Reassemble the message with new headers prepended
+    # Normalise line endings in original
+    raw = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+
+    return b"".join(f.encode("utf-8") + b"\r\n" for f in new_fields) + raw
+
+
+def sign_fields(headers: list[bytes], body_hashes: dict,
+                selector: str, domain: str, keyfile: str, *,
+                mailfrom: str = "<>", rcptto: list[str] | None = None,
+                timestamp: int | None = None,
+                next_domain: str | None = None,
+                flags: list[str] | None = None,
+                upstream=None,
+                allow_null_body_recipe: bool | None = None,
+                skip_upstream_check: bool = False,
+                exploded: bool = False,
+                skip_from_check: bool = False,
+                parent_from=None) -> list[str]:
+    """sign_message() for a caller that never holds the whole message: a
+    milter, say, which is handed the header fields and then the body in
+    pieces.
+
+    headers are the message's header fields as parse_message() gives them.
+    body_hashes maps each hash algorithm for a new Message-Instance to the
+    body's digest (BodyHasher.digests(), or compute_body_hash()).
+
+    upstream is the gate's verdict: when the message already carries a
+    DKIM2 chain, the dkim2verify.VerifyResult of verifying the message as
+    received in outbound mode (MessageVerifier(..., full_chain=True,
+    allow_unsigned_mi=True), fed as the message arrives).  A chain with no
+    verdict, or a failing one, raises SigningRefused, as sign_message()
+    does.  The other arguments are sign_message()'s.
+
+    Returns the header fields to put at the top of the message, topmost
+    first, each a str with its field name and no line break: the
+    DKIM2-Signature, and after it the new Message-Instance if one was
+    needed.
+    """
+    private_key, algorithm = load_private_key(keyfile)
+
+    # Find any existing Message-Instance and DKIM2-Signature headers
+    existing_mi: list[str] = []
+    existing_sig: list[str] = []
+    for hdr in headers:
+        name = _header_name(hdr)
+        if name == b"message-instance":
+            existing_mi.append(hdr.decode("utf-8", errors="surrogateescape"))
+        elif name == b"dkim2-signature":
+            existing_sig.append(hdr.decode("utf-8", errors="surrogateescape"))
+
+    # Out-of-range numbers are refused even with the gate bypassed: the next
+    # i= and m= below are computed from them.
+    range_error = chain_range_error(existing_mi, existing_sig)
+    if range_error:
+        raise SigningRefused(f"not signing: {range_error}")
+
+    if allow_null_body_recipe:
+        _warn_allow_null_body_recipe()
+
+    if (existing_mi or existing_sig) and not skip_upstream_check:
+        _gate_upstream(upstream, existing_sig, signing_domain=domain)
+
+    if not skip_from_check and _from_needs_check(existing_mi, existing_sig):
+        from_fields = [h for h in headers if _header_name(h) == b"from"]
+        refusal = _from_refusal(from_fields, domain, parent_from)
+        if refusal:
+            raise SigningRefused(refusal)
+
+    # Determine version numbers
+    top_mi = None
+    mi_version = 1
+    if existing_mi:
+        top_mi = max(existing_mi, key=_get_version_from_mi)
+        mi_version = _get_version_from_mi(top_mi) + 1
+
+    sig_seq = 1
+    if existing_sig:
+        sig_seq = max(_get_seq_from_sig(h) for h in existing_sig) + 1
+
+    # Build Message-Instance header
+    mi_hdr = build_message_instance_from_hashes(headers, body_hashes,
+                                                version=mi_version)
+
+    # -09 §12.1: a hop that leaves both hashes unchanged adds no new
+    # Message-Instance at all — it signs against the existing top instance and
+    # reuses its m=.  Emitting an instance with identical hashes and no Recipe
+    # is not forbidden, but §12.1 still calls it "most likely to be pointless
+    # and a waste of time and energy"; this implementation avoids it by
+    # default, and verifiers must still tolerate one from elsewhere.
+    if top_mi is not None and _mi_hashes(top_mi) == _mi_hashes(mi_hdr):
+        mi_version = _get_version_from_mi(top_mi)
+        mi_hdr = None
+
+    # Build DKIM2-Signature header
+    sig_hdr = build_dkim2_signature(
+        existing_mi, existing_sig, mi_hdr,
+        domain, selector, private_key, algorithm,
+        mailfrom=mailfrom, rcptto=rcptto,
+        seq=sig_seq, mi_version=mi_version,
+        timestamp=timestamp,
+        next_domain=next_domain, flags=flags, exploded=exploded,
+    )
+    return [sig_hdr] if mi_hdr is None else [sig_hdr, mi_hdr]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Sign an email with DKIM2 (draft-ietf-dkim-dkim2-spec-09)")
+    parser.add_argument("message", help="Path to raw email file (- for stdin)")
+    parser.add_argument("-s", "--selector", required=True,
+                        help="DKIM2 selector name")
+    parser.add_argument("-d", "--domain", required=True,
+                        help="Signing domain")
+    parser.add_argument("-k", "--keyfile", required=True,
+                        help="Path to PEM private key file")
+    parser.add_argument("--mailfrom", default="<>",
+                        help="MAIL FROM value (default: <>)")
+    parser.add_argument("--rcptto", action="append",
+                        help="RCPT TO value(s) (repeatable)")
+    parser.add_argument("--timestamp", type=int, default=None,
+                        help="Unix timestamp (default: current time)")
+    parser.add_argument("--next-domain",
+                        help="Next-hop domain (nd=); emits an nd= chain "
+                             "tag instead of mf=/rt=")
+    parser.add_argument("--flag", action="append", dest="flags",
+                        help="Signature flag (f=); repeatable")
+    parser.add_argument("--exploded", action="store_true",
+                        help="this hop sends copies to more than one address: "
+                             "set the exploded flag (-09 §12.5; never at i=1, "
+                             "and set anyway when rt= has more than one "
+                             "address)")
+    parser.add_argument("--hash", dest="hash_algs", default="sha256",
+                        choices=["sha256", "sha512", "both"],
+                        help="hash algorithm(s) for the Message-Instance h= tag "
+                             "(-09 §3.1; default sha256)")
+    parser.add_argument("--allow-null-body-recipe", action="store_true",
+                        help="deprecated, does nothing: an unsigned null body "
+                             "Recipe is always signed over (-09)")
+    parser.add_argument("--parent-from", action="append", default=[],
+                        metavar="DOMAIN", dest="parent_from",
+                        help="allow d= to sign for a From in this parent "
+                             "domain (repeatable)")
+    parser.add_argument("--dns-json",
+                        default=os.environ.get("DKIM2_DNS_JSON"),
+                        help="dns.json with keys to verify an existing chain "
+                             "(default: $DKIM2_DNS_JSON)")
+    parser.add_argument("--ignore-timestamps", action="store_true",
+                        dest="skip_timestamp_check",
+                        help="skip the timestamp check when verifying an "
+                             "existing chain")
+    args = parser.parse_args()
+
+    if args.message == "-":
+        raw = sys.stdin.buffer.read()
+    else:
+        raw = Path(args.message).read_bytes()
+
+    if args.allow_null_body_recipe:
+        print("dkim2sign: warning: --allow-null-body-recipe is deprecated and "
+              "does nothing: an unsigned null body Recipe is always signed "
+              "over", file=sys.stderr)
+
+    rcptto = args.rcptto or ["unknown@example.com"]
+    if args.dns_json:
+        os.environ["DKIM2_DNS_JSON"] = args.dns_json
+
+    algs = ["sha256", "sha512"] if args.hash_algs == "both" else [args.hash_algs]
+
+    try:
+        result = sign_message(raw, args.selector, args.domain, args.keyfile,
+                              mailfrom=args.mailfrom, rcptto=rcptto,
+                              timestamp=args.timestamp,
+                              next_domain=args.next_domain, flags=args.flags,
+                              exploded=args.exploded, algs=algs,
+                              skip_timestamp_check=args.skip_timestamp_check,
+                              parent_from=parent_from_set(args.parent_from))
+    except SigningRefused as e:
+        print(f"dkim2sign: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    sys.stdout.buffer.write(result)
+
+
+if __name__ == "__main__":
+    main()
