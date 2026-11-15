@@ -431,9 +431,13 @@ class EnvelopeMilter(Milter.Base):
         return bool(dkim2_authserv_id) and not self.getsymval('{auth_authen}')
 
     def dkim2_may_sign(self):
-        # only mail we relay off-site is ever signed.  Unwrapping does not
-        # change this: a wrapped recipient is already an off-site one
-        return bool(dkim2_keydir) and bool(self.offsite_rcpts())
+        # will the body's hash be wanted?  It is if we may sign (only mail
+        # we relay off-site is; unwrapping does not change this, a wrapped
+        # recipient is already an off-site one) or may have a header change
+        # to record: those are made for off-site recipients and for aliases
+        if self.offsite_rcpts():
+            return True
+        return test_virtual_alias([k for k in self.rcpt_keys() if not is_ignored(k)])
 
     def dkim2_abandon(self):
         # a message that never reached eom() (the client gave up, or sent
@@ -680,14 +684,19 @@ class EnvelopeMilter(Milter.Base):
         return seen.body_changed_since_signature()
 
     def dkim2_sign(self, queue_id, exploded):
-        # last of all: record what we changed and sign for the envelope the
-        # message leaves in.  Only mail we relay off-site, and never over a
-        # chain that did not verify when it arrived
-        if self.dkim2_off or not dkim2_keydir or not self.offsite_rcpts():
+        # last of all: sign for the envelope the message leaves in, or at
+        # least say what we changed.  Only mail we relay off-site is
+        # signed, and never over a chain that did not verify when it arrived
+        if self.dkim2_off:
             return
-        if self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
-            logging.info(f"{queue_id} dkim2: not signing, arrival was {self.dkim2_arrival_status} [{self.id}]")
-            return
+        if dkim2_keydir and self.offsite_rcpts():
+            if self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
+                logging.info(f"{queue_id} dkim2: not signing, arrival was {self.dkim2_arrival_status} [{self.id}]")
+            elif self.dkim2_signed(queue_id, exploded):
+                return
+        self.dkim2_record(queue_id)
+
+    def dkim2_signed(self, queue_id, exploded):
         mail_from = self.env_from_out or email.utils.parseaddr(self.mail_from)[1]
         try:
             signed = dkim2hop.sign(self.dkim2_seen(), self.fields_after_changes(),
@@ -695,16 +704,40 @@ class EnvelopeMilter(Milter.Base):
                                    exploded=exploded, selector=dkim2_selector)
         except Exception:
             self.dkim2_give_up("signing")
-            return
+            return True
         if not signed:
             logging.info(f"{queue_id} dkim2: not signing: {signed.reason} [{self.id}]")
-            return
+            return False
         # each goes in at the top, so the last one in is the first field
         for name, value in reversed(signed.insert):
             self.addheader(name, value, 0)
         logging.info(
             f"{queue_id} dkim2: signed d={signed.domain} for {mail_from} "
             f"({', '.join(n for n, _v in signed.insert)}) [{self.id}]")
+        return True
+
+    def dkim2_record(self, queue_id):
+        # we are not signing, but we may have changed header fields DKIM2
+        # hashes (To and Cc unwrapped; From, for an alias).  Always say so,
+        # in Message-Instance fields nobody has signed: the copy that goes
+        # on to mailman keeps a chain that describes it, which the fan-out
+        # signs over with mailman's instance and its own.  A copy that
+        # leaves us like this will not verify at the next hop, but it
+        # would not have with the change unrecorded, and now it says what
+        # we did
+        if not self.header_changes:
+            return
+        try:
+            recorded = dkim2hop.record(self.dkim2_seen(), self.fields_after_changes())
+        except Exception:
+            self.dkim2_give_up("recording changes")
+            return
+        if not recorded:
+            logging.debug(f"{queue_id} dkim2: no instance added: {recorded.reason} [{self.id}]")
+            return
+        for name, value in reversed(recorded.insert):
+            self.addheader(name, value, 0)
+        logging.info(f"{queue_id} dkim2: recorded our header changes in an unsigned Message-Instance [{self.id}]")
 
     def eom(self):
         queue_id = None
