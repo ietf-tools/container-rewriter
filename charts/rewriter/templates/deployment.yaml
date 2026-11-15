@@ -50,6 +50,20 @@ spec:
               value: {{ .Values.rewriter.mailmanSaslUser }}
             - name: IGNORELIST
               value: {{ .Values.rewriter.ignoreList }}
+            {{- with .Values.rewriter.dkim2 }}
+            {{- if .authservId }}
+            - name: DKIM2_AUTHSERV_ID
+              value: {{ .authservId | quote }}
+            {{- end }}
+            {{- if .keys }}
+            - name: DKIM2_KEYDIR
+              value: /etc/dkim2/keys
+            {{- if .selector }}
+            - name: DKIM2_SELECTOR
+              value: {{ .selector | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             - name: DB_HOST
               valueFrom:
                 secretKeyRef:
@@ -78,6 +92,11 @@ spec:
           volumeMounts:
             - name: logs
               mountPath: /var/log
+            {{- range $i, $k := .Values.rewriter.dkim2.keys }}
+            - name: dkim2-key-{{ $i }}
+              mountPath: /etc/dkim2/keys/{{ required "rewriter.dkim2.keys[].domain is required" $k.domain | lower }}
+              readOnly: true
+            {{- end }}
           {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
@@ -117,6 +136,13 @@ spec:
       volumes:
         - name: logs
           emptyDir: {}
+        {{- range $i, $k := .Values.rewriter.dkim2.keys }}
+        - name: dkim2-key-{{ $i }}
+          secret:
+            secretName: {{ required "rewriter.dkim2.keys[].existingSecretName is required" $k.existingSecretName }}
+            # owner root, group fsGroup: the rewriter reads them as a group member
+            defaultMode: 0440
+        {{- end }}
         {{- if .Values.filebeat.enabled }}
         - name: filebeat-config
           configMap:

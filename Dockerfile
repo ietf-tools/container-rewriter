@@ -14,12 +14,16 @@ RUN apt-get update && \
     apt-get autoremove --yes && \
     rm -rf /var/lib/{apt,dpkg,cache,log} && \
     pip install -r requirements.txt && \
-    adduser rewriter
+    groupadd --gid 10001 rewriter && \
+    useradd --uid 10001 --gid rewriter --no-create-home --shell /usr/sbin/nologin rewriter && \
+    chgrp rewriter /var/log && chmod g+w /var/log
 
 
 ADD . /app
 
-#USER rewriter
+# numeric, so Kubernetes runAsNonRoot can check it; the chart's fsGroup
+# and runAsUser use the same ids
+USER 10001:10001
 
 EXPOSE 8800
 
