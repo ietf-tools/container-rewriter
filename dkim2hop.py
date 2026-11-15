@@ -268,16 +268,12 @@ class Signed:
 
     insert   header fields to put at the top of the message, topmost first,
              as (name, value) with LF line breaks, ready for insheader()
-    delete   the Message-Instance fields to remove first: their positions
-             among the message's Message-Instance fields, counted from 1 at
-             the top, as chgheader() counts them
     reason   why nothing was signed, when insert is empty
     domain   the signing domain
     """
 
-    def __init__(self, insert=(), delete=(), reason=None, domain=None):
+    def __init__(self, insert=(), reason=None, domain=None):
         self.insert = list(insert)
-        self.delete = list(delete)
         self.reason = reason
         self.domain = domain
 
@@ -341,12 +337,14 @@ def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
              see find_key()
     exploded the message is one of many copies (a list's fan-out)
 
-    A message that already has DKIM2 signatures gets the next
-    Message-Instance, with a Recipe that restores the header fields the
-    rewriter changed, and the next signature; a chain that did not verify
-    is not signed (-09 section 12).  A message with none gets m=1 and i=1;
-    any Message-Instance on it that nobody signed is replaced, since it
-    describes a message the rewriter has since changed.
+    A message that already has Message-Instance fields gets the next one,
+    with a Recipe that restores the header fields the rewriter changed,
+    and the next signature (the first, if nobody has signed yet).  The
+    signature covers every instance below it, so instances nobody signed
+    -- our list manager's -- are answered for by us: they reached us over
+    a path we trust.  They must still describe the message: a chain that
+    does not verify is not signed (-09 section 12).  A message with no
+    DKIM2 fields gets m=1 and i=1.
 
     Returns a Signed.  Nothing is signed (and .reason says why) when there
     is no key for the sender's domain, the sender is null, the existing
@@ -371,14 +369,12 @@ def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
     changed = (dkim2sign.compute_header_hash(_bare(before))
                != dkim2sign.compute_header_hash(_bare(after)))
 
-    delete, mine = [], []
-    if instances and not signatures:
-        # Unsigned instances (a list manager's, say) describe the message
-        # before our changes.  Nobody has vouched for them: start again.
-        if changed:
-            delete = list(range(1, len(instances) + 1))
-            after = [f for f in after if not is_field(f, b"message-instance")]
-    elif instances and changed:
+    mine = []
+    if instances and changed:
+        # Every instance already here stays, signed or not: one nobody has
+        # signed is our own list manager's, handed to us over a path we
+        # trust, and our signature covers it along with ours.  The gate
+        # below still has to find that they describe the message we got.
         version = max(dkim2sign._get_version_from_mi(f.decode("utf-8", "surrogateescape"))
                       for f in instances) + 1
         # header fields only: the body is the one we were given
@@ -401,4 +397,4 @@ def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
 
     return Signed(insert=[_for_milter(f.encode("utf-8")) for f in added]
                   + [_for_milter(f) for f in mine],
-                  delete=delete, domain=domain)
+                  domain=domain)

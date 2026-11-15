@@ -146,10 +146,12 @@ def author_post(keys, sender=AUTHOR):
     return fields(*signed.insert) + plain
 
 
-def through_mailman(arrived, footer=FOOTER, instance=True):
+def through_mailman(arrived, footer=FOOTER, instance=True, null_body=False):
     """What a list manager that records its own changes sends back to us for
     fan-out: a subject tag, a List-Id, perhaps a footer, and an unsigned
-    Message-Instance that says so."""
+    Message-Instance that says so (the next after any the post came with).
+    null_body: it rewrote the body and says only that, with a null body
+    Recipe.  instance=False is stock Mailman, which records nothing."""
     out = []
     for f in arrived:
         if dkim2hop._name(f) == b"subject":
@@ -160,7 +162,11 @@ def through_mailman(arrived, footer=FOOTER, instance=True):
     if instance:
         bare = lambda fs: [f[:-2] for f in fs]          # noqa: E731
         recipe = dkim2hop.dkim2sign.build_recipes(bare(arrived), BODY, bare(out), body)
-        mi = dkim2hop.dkim2sign.build_message_instance(bare(out), body, version=2, recipe=recipe)
+        if null_body:
+            recipe["b"] = None
+        version = 1 + len([f for f in arrived if dkim2hop._name(f) == b"message-instance"])
+        mi = dkim2hop.dkim2sign.build_message_instance(
+            bare(out), body, version=version, recipe=recipe if version > 1 else None)
         out = [mi.encode() + b"\r\n"] + out
     return out, body
 
@@ -250,6 +256,40 @@ def test_footer_means_new_from_and_a_verifiable_chain(dkim2, keys):
     assert result.status == "pass", result.message
 
 
+def test_body_the_list_could_not_describe_is_still_signed(dkim2, keys):
+    """Mailman rewrote the body and recorded only that it did (a null body
+    Recipe).  The body is not the one example.com signed and cannot be put
+    back, but the copy came to us from our own list manager: it gets a From
+    of ours and our signature over mailman's instance and ours.  Verifiers
+    report a null Recipe as a permerror (-09), which is the truth."""
+    arrived = fields(("X-DKIM2-Arrival", "pass")) + author_post(keys)
+    out, body = through_mailman(arrived, null_body=True)
+    sent = send(dkim2, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
+    assert sent.value("From") == f"Alice <{WRAPPED}>"
+    assert [f.split(b";")[0].split(b"=")[1] for f in sent.named("Message-Instance")] == [b"3", b"2", b"1"]
+    assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["2", "3"]
+    result = verified(dkim2, sent)
+    assert result.status == "permerror" and "m=2 has a null recipe" in result.message
+
+
+def test_unsigned_post_with_the_lists_instance_is_signed_over_it(dkim2, monkeypatch):
+    """Nobody signed the post; mailman's m=1 describes what it handed us.
+    The DMARC rule gives the copy a From of ours, and our m=2 and i=1
+    cover mailman's instance too: it is not thrown away."""
+    pins = harness.parse_pins(["example.com=reject"], "--dmarc")
+    monkeypatch.setattr(dkim2, "checkdmarc", harness.LoggedCheckdmarc(harness.FakeDNS(pins, {}, True)))
+    dkim2._policy_cache.clear()
+    plain = fields(("X-DKIM2-Arrival", "none"), ("From", f"Alice <{AUTHOR}>"), ("To", LIST),
+                   ("Subject", "hello"))
+    out, body = through_mailman(plain)
+    sent = send(dkim2, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
+    assert sent.value("From") == f"Alice <{WRAPPED}>"
+    assert [f.split(b";")[0].split(b"=")[1] for f in sent.named("Message-Instance")] == [b"2", b"1"]
+    assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["1", "2"]
+    result = verified(dkim2, sent)
+    assert result.status == "pass", result.message
+
+
 def test_no_footer_keeps_the_authors_from(dkim2, keys):
     """Headers changed, the body did not: example.com still answers for the
     content, so From stays and we only add our signature."""
@@ -304,13 +344,18 @@ def test_failed_arrival_is_not_signed_and_from_is_left_alone(dkim2, keys):
 
 
 def test_changes_nobody_recorded_are_not_signed(dkim2, keys):
-    """A list manager that changed the message without a Message-Instance:
-    we cannot say what it was, so the copy goes out as it is."""
+    """A list manager that changed the message without a Message-Instance
+    (stock Mailman): there is no Recipe for what it did and we cannot write
+    one, so the copy goes out as it is -- From and envelope included,
+    since we will not be signing to answer for it."""
     arrived = fields(("X-DKIM2-Arrival", "pass")) + author_post(keys)
     out, body = through_mailman(arrived, instance=False)
     sent = send(dkim2, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
     assert sent.result == dkim2.Milter.ACCEPT
     assert len(sent.named("DKIM2-Signature")) == 1
+    assert sent.value("From") == f"Alice <{AUTHOR}>"
+    assert sent.named("X-Original-From") == []
+    assert sent.mail_from == BOUNCES
 
 
 def test_list_copy_with_no_offsite_recipient_is_not_signed(dkim2, keys):

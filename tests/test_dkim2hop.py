@@ -51,14 +51,7 @@ def fields(*pairs):
 
 def apply(signed, header_fields):
     """A message's header fields after the milter has done what sign() says."""
-    out, seen = [], 0
-    for f in header_fields:
-        if dkim2hop._name(f) == b"message-instance":
-            seen += 1
-            if seen in signed.delete:
-                continue
-        out.append(f)
-    return fields(*signed.insert) + out
+    return fields(*signed.insert) + list(header_fields)
 
 
 def tag(field, name):
@@ -102,7 +95,7 @@ def test_unsigned_message_gets_m1_and_i1(keys):
     signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False), before, "chair@ietf.org", ["bob@example.net"],
                            keydir, timestamp=T)
     assert [n for n, _v in signed.insert] == ["DKIM2-Signature", "Message-Instance"]
-    assert signed.delete == [] and signed.domain == "ietf.org"
+    assert signed.domain == "ietf.org"
     sent = apply(signed, before)
     sig = named(sent, b"dkim2-signature")[0]
     assert (tag(sig, "i"), tag(sig, "m"), tag(sig, "d")) == ("1", "1", "ietf.org")
@@ -166,21 +159,40 @@ def test_unchanged_message_is_signed_over_the_instance_it_has(keys):
     assert dkim2hop.verify(sent, BODY, BOUNCES, ["sub@example.net"], dns).status == "pass"
 
 
-def test_unsigned_instances_are_replaced_when_the_rewriter_changes_the_message(keys):
+def test_unsigned_instances_are_kept_and_signed_over(keys):
+    """A post nobody signed, with our list manager's unsigned m=1: it came
+    to us by a path we trust, so its instance stays, ours is the next one
+    (with a Recipe back to it), and the one signature covers both."""
     keydir, dns = keys
-    # a list manager's unsigned m=1 over the message before our From rewrite
     before = fields(("From", "Alice <alice@example.com>"), ("To", LIST))
-    stale = dkim2hop.dkim2sign.build_message_instance(before, BODY).encode() + b"\r\n"
-    before = [stale] + before
+    theirs = dkim2hop.dkim2sign.build_message_instance(dkim2hop._bare(before), BODY).encode() + b"\r\n"
+    before = [theirs] + before
     after = [dkim2hop.header_field("From", "Alice <alice=40example.com@dmarc.ietf.org>")
              if dkim2hop._name(f) == b"from" else f for f in before]
     signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False), after, BOUNCES, ["sub@example.net"],
                            keydir, timestamp=T)
     assert signed, signed.reason
-    assert signed.delete == [1]
+    assert [n for n, _v in signed.insert] == ["DKIM2-Signature", "Message-Instance"]
     sent = apply(signed, after)
-    assert len(named(sent, b"message-instance")) == 1
-    assert dkim2hop.verify(sent, BODY, BOUNCES, ["sub@example.net"], dns).status == "pass"
+    assert [tag(f, "m") for f in named(sent, b"message-instance")] == ["2", "1"]
+    assert theirs in sent
+    recipe = json.loads(base64.b64decode(tag(named(sent, b"message-instance")[0], "r")))
+    assert [s.strip() for s in recipe["h"]["from"][0]["d"]] == ["Alice <alice@example.com>"]
+    top_sig = named(sent, b"dkim2-signature")[0]
+    assert (tag(top_sig, "i"), tag(top_sig, "m")) == ("1", "2")
+    result = dkim2hop.verify(sent, BODY, BOUNCES, ["sub@example.net"], dns)
+    assert result.status == "pass", result.message
+
+
+def test_unsigned_instance_that_is_not_this_message_is_refused(keys):
+    keydir, dns = keys
+    before = fields(("From", "Chair <chair@ietf.org>"), ("To", LIST))
+    wrong = dkim2hop.dkim2sign.build_message_instance(
+        dkim2hop._bare(before), BODY + b"something else\r\n").encode() + b"\r\n"
+    before = [wrong] + before
+    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False), before, BOUNCES, ["sub@example.net"],
+                           keydir, timestamp=T)
+    assert not signed and signed.reason.startswith("not signing")
 
 
 # --- refusals ---------------------------------------------------------------------

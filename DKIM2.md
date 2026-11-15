@@ -37,9 +37,11 @@ set:
 - does nothing if the arrival verdict was `fail`, `permerror` or
   `temperror`;
 - adds a `Message-Instance` recording the header fields the rewriter itself
-  changed, with a Recipe that restores them, if the message already has a
-  DKIM2 chain; or `m=1` if it has none;
-- adds a `DKIM2-Signature` naming the envelope the message leaves in. Every
+  changed, with a Recipe that restores them, if the message already has
+  `Message-Instance` fields (signed or not); or `m=1` if it has none;
+- adds a `DKIM2-Signature` naming the envelope the message leaves in. It
+  covers every instance below it, so one signature answers for mailman's
+  unsigned instance and the rewriter's own (see "The trusted path"). Every
   recipient of the SMTP transaction goes into `rt=` together, so whatever
   batches the recipients decides who is named alongside whom;
 - sets the `exploded` flag on a mailman fan-out.
@@ -89,13 +91,40 @@ is signed, and the chain starts with us.
 The rule applies to mailman fan-out only. Alias forwarding keeps its existing
 rules.
 
+The From is only taken over when the copy will be signed: if the chain
+mailman hands back does not verify (stock Mailman, below), From and the
+envelope are left as they are.
+
+## The trusted path
+
+Between the arrival check and the signature the message is in our hands:
+the rewriter verified it as it came in, mailman received it from us, and
+mailman hands the copies back over an authenticated connection. So when
+the arrival verdict was `pass` or `none`, the `Message-Instance` fields
+nobody has signed yet are ours to answer for, whichever of our components
+wrote them. The rewriter keeps them, adds its own as the next one, and
+signs once over all of them. That holds when the signature is the first on
+the message too: a post nobody signed, which mailman gave an `m=1`, leaves
+with mailman's `m=1`, the rewriter's `m=2` and `i=1; m=2`.
+
+The body may have changed since the last signature; that is what the
+instances are for. If mailman could not describe the change (it records a
+null body Recipe when it rewrites the body), the copy is still signed: From
+is ours by then. Verifiers report a null Recipe as `permerror`, as -09 says
+they must.
+
+Trust does not replace the Recipes. The instances still have to describe
+the message the rewriter was handed, or what we sign would not verify
+anywhere.
+
 ## What mailman has to do
 
 The rewriter can account for its own changes, not mailman's. If mailman
 changes a signed post (subject tag, `List-*` fields, footer) without adding a
-`Message-Instance` that says so, the chain no longer verifies and the
-rewriter leaves the copy unsigned. That is safe, and it is what happens with
-stock Mailman 3.
+`Message-Instance` that says so, there is nothing to undo those changes
+with, the chain no longer verifies, and the rewriter leaves the copy as
+mailman made it: unsigned, with the author's From. That is safe, and it is
+what happens with stock Mailman 3.
 
 For signed list mail, mailman needs the Message-Instance patches from
 <https://github.com/brong/mailman> (branch `dkim2-3.3.10` for the 3.3.10
@@ -241,7 +270,8 @@ Log lines all start `<queue id> dkim2:`.
 ## Limits
 
 - Bounces (null envelope sender) are not signed.
-- Stock Mailman's list copies of signed posts are not signed (above).
+- Stock Mailman's list copies of signed posts are not signed, and keep the
+  author's From (above).
 - Signing uses one key. Two signatures side by side (RSA and Ed25519) are
   not supported.
 - Postfix's `lmtp_generic_maps` restores the original From on the copy

@@ -668,7 +668,16 @@ class EnvelopeMilter(Milter.Base):
         if not dkim2hop.find_key(keydir=dkim2_keydir, selector=dkim2_selector,
                                  domain=env_from_addr.rsplit("@", 1)[-1]):
             return False
-        return self.dkim2_seen().body_changed_since_signature()
+        seen = self.dkim2_seen()
+        # only take From over when we are going to sign for it.  Every
+        # change since the last signature has to be recorded in an instance
+        # (mailman's, with the Message-Instance patches); stock Mailman
+        # records nothing, the chain it hands back does not verify, sign()
+        # will refuse, and a rewritten From with no signature of ours
+        # behind it helps nobody
+        if seen.result().status != "pass":
+            return False
+        return seen.body_changed_since_signature()
 
     def dkim2_sign(self, queue_id, exploded):
         # last of all: record what we changed and sign for the envelope the
@@ -690,8 +699,6 @@ class EnvelopeMilter(Milter.Base):
         if not signed:
             logging.info(f"{queue_id} dkim2: not signing: {signed.reason} [{self.id}]")
             return
-        for idx in sorted(signed.delete, reverse=True):
-            self.chgheader("Message-Instance", idx, None)
         # each goes in at the top, so the last one in is the first field
         for name, value in reversed(signed.insert):
             self.addheader(name, value, 0)
