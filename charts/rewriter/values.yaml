@@ -18,6 +18,21 @@ rewriter:
     - myaddr.com
   rewriteDomains:
     lists.myaddr.com: dmarc.myaddr.com
+  # DKIM2 (see DKIM2.md); everything here is off by default
+  dkim2:
+    # authserv-id for Authentication-Results; set it to turn on verification
+    # of arriving mail. Use the name rspamd already reports under,
+    # e.g. mail.ietf.org
+    authservId: ""
+    # selector to sign with: the key is <selector>.key in each domain's
+    # Secret. Empty means the newest (last by name) .key file is used
+    selector: ""
+    # one entry per signing domain; any entry turns on signing. Each Secret
+    # holds one or more <selector>.key items (PEM private keys). A domain's
+    # key also signs for its subdomains (ietf.org covers dmarc.ietf.org)
+    keys: []
+    #  - domain: ietf.org
+    #    existingSecretName: rewriter-dkim2-ietf-org
   database:
     host:
       existingSecretName: db-app
@@ -59,10 +74,18 @@ podAnnotations: {}
 # For more information checkout: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
 podLabels: {}
 
-podSecurityContext: {}
+# fsGroup makes mounted volumes (the DKIM2 key Secrets) readable by the
+# rewriter user's group. It applies to the whole pod, filebeat included
+podSecurityContext:
+  fsGroup: 10001
 
+# the rewriter container only: filebeat keeps its image's own user
 securityContext:
   privileged: false
+  runAsUser: 10001
+  runAsGroup: 10001
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
 
 # This is for setting up a service more information can be found here: https://kubernetes.io/docs/concepts/services-networking/service/
 service:
