@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import TimedRotatingFileHandler
 
 import checkdmarc
+import dkim2hop
 import Milter
 import psycopg
 from expiringdict import ExpiringDict
@@ -29,6 +30,23 @@ ignore_list = parse_ignore_list(os.environ.get("IGNORELIST", "alldanes@lists.sys
 # then as user@domain
 recipient_delimiter = os.environ.get("RECIPIENT_DELIMITER", "+")
 mailman_sasl_user = os.environ.get("MAILMAN_SASL_USER", "mailman@ietf.org").lower()
+
+# DKIM2 (draft-ietf-dkim-dkim2-spec-09), off unless configured.
+# DKIM2_KEYDIR: sign mail relayed off-site, with the key in
+#   <DKIM2_KEYDIR>/<signing domain>/<DKIM2_SELECTOR>.key; the signing domain
+#   is the envelope sender's domain or the nearest parent with a directory.
+#   Without DKIM2_SELECTOR the newest key in the directory is used.
+# DKIM2_AUTHSERV_ID: verify the DKIM2 chain on mail arriving from outside
+#   and report it in an Authentication-Results field under this name.
+dkim2_keydir = os.environ.get("DKIM2_KEYDIR", "")
+dkim2_selector = os.environ.get("DKIM2_SELECTOR", "")
+dkim2_authserv_id = os.environ.get("DKIM2_AUTHSERV_ID", "")
+# where keys are looked up: None is the DNS; the tests give a table
+dkim2_dns = None
+# how the chain a message arrived with checked out, carried through mailman
+# to the fan-out; set here on arrival, and never taken from outside
+DKIM2_ARRIVAL = "X-DKIM2-Arrival"
+DKIM2_NOT_VERIFIED = ("fail", "permerror", "temperror")
 
 _policy_cache = ExpiringDict(max_len=50000, max_age_seconds=1800)
 
@@ -329,6 +347,12 @@ class EnvelopeMilter(Milter.Base):
         self.header_from = None
         self.header_to = None
         self.addr_headers = []
+        self.fields = []
+        self.seen = None
+        self.header_changes = []
+        self.env_from_out = None
+        self.dkim2_arrival_status = None
+        self.dkim2_off = False
 
     def envfrom(self, f, *str):
         # one milter instance serves every message on an SMTP connection
@@ -336,6 +360,13 @@ class EnvelopeMilter(Milter.Base):
         self.header_from = None
         self.header_to = None
         self.addr_headers = []
+        self.dkim2_abandon()
+        self.fields = []
+        self.seen = None
+        self.header_changes = []
+        self.env_from_out = None
+        self.dkim2_arrival_status = None
+        self.dkim2_off = False
         # addresses keep their case: local parts (SRS, VERP) can be case
         # sensitive and delrcpt() must name the recipient exactly as given;
         # internal_addr() gives the lowercased form for comparisons
@@ -388,7 +419,84 @@ class EnvelopeMilter(Milter.Base):
             self.header_to = value
         if name.lower() in ("to", "cc"):
             self.addr_headers.append((name, value))
+        if (dkim2_keydir or dkim2_authserv_id) and not self.dkim2_off:
+            try:
+                self.fields.append(dkim2hop.header_field(name, value))
+            except Exception:
+                self.dkim2_give_up("header")
         return Milter.CONTINUE
+
+    def dkim2_arriving(self):
+        # mail from outside, whose chain we verify against its envelope
+        return bool(dkim2_authserv_id) and not self.getsymval('{auth_authen}')
+
+    def dkim2_may_sign(self):
+        # only mail we relay off-site is ever signed.  Unwrapping does not
+        # change this: a wrapped recipient is already an off-site one
+        return bool(dkim2_keydir) and bool(self.offsite_rcpts())
+
+    def dkim2_abandon(self):
+        # a message that never reached eom() (the client gave up, or sent
+        # RSET) may have key lookups queued: drop them
+        seen, self.seen = self.seen, None
+        if seen is not None:
+            try:
+                seen.abandon()
+            except Exception:
+                pass
+
+    def abort(self):
+        self.dkim2_abandon()
+        return Milter.CONTINUE
+
+    def close(self):
+        self.dkim2_abandon()
+        return Milter.CONTINUE
+
+    def dkim2_give_up(self, where):
+        # DKIM2 must never be the reason mail is not delivered: whatever
+        # goes wrong in it, this message carries on without it -- no
+        # verdict, no signature -- exactly as if DKIM2 were not configured
+        queue_id = self.getsymval('i') or '-'
+        logging.exception(f"{queue_id} dkim2: error in {where}, carrying on without DKIM2 [{self.id}]")
+        self.dkim2_off = True
+        self.seen = None
+
+    def eoh(self):
+        # the header fields are all here: from now on the body is hashed and
+        # the DKIM2 chain verified as the body arrives, and never kept
+        if (dkim2_keydir or dkim2_authserv_id) and not self.dkim2_off:
+            try:
+                self.dkim2_seen()
+            except Exception:
+                self.dkim2_give_up("eoh")
+        return Milter.CONTINUE
+
+    def body(self, chunk):
+        if self.seen is not None:
+            try:
+                self.seen.feed(chunk)
+            except Exception:
+                self.dkim2_give_up("body")
+        return Milter.CONTINUE
+
+    def change_header(self, name, idx, value):
+        # chgheader(), remembered so the DKIM2 Message-Instance can record
+        # what the header field was before (idx counts from 1; 0 is the first)
+        self.chgheader(name, idx, value)
+        self.header_changes.append((name, max(idx, 1), value))
+
+    def fields_after_changes(self):
+        fields = list(self.fields)
+        for name, idx, value in self.header_changes:
+            seen = 0
+            for i, field in enumerate(fields):
+                if dkim2hop._name(field) == name.lower().encode():
+                    seen += 1
+                    if seen == idx:
+                        fields[i] = dkim2hop.header_field(name, value)
+                        break
+        return fields
 
     def change_env_from(self, env_from_addr, new_addr, queue_id):
         # RFC 5321 4.5.5: a null sender (bounce, DSN) must stay null so a
@@ -397,6 +505,7 @@ class EnvelopeMilter(Milter.Base):
             logging.info(f"{queue_id} none: null Envelope-From kept, not changed to {new_addr} [{self.id}]")
             return env_from_addr
         self.chgfrom(new_addr)
+        self.env_from_out = new_addr
         return new_addr
 
     def log_envelope_wrap(self, env_from_addr, new_env_from):
@@ -408,7 +517,7 @@ class EnvelopeMilter(Milter.Base):
 
     def change_header_from(self, name, new_addr):
         # keep the original From, as postconfirm did, so it isn't lost
-        self.chgheader("From", 0, format_from_header(name, new_addr))
+        self.change_header("From", 0, format_from_header(name, new_addr))
         self.addheader("X-Original-From", self.header_from)
 
     def unwrap_list_bounces(self, queue_id):
@@ -463,7 +572,7 @@ class EnvelopeMilter(Milter.Base):
             idx = counts[name.lower()] = counts.get(name.lower(), 0) + 1
             new_value = unwrap_header_addrs(value)
             if new_value is not None:
-                self.chgheader(name, idx, new_value)
+                self.change_header(name, idx, new_value)
                 logging.info(f"{queue_id} unwrap: header-{name} changed from {value} to {new_value} [{self.id}]")
         return added
 
@@ -493,128 +602,116 @@ class EnvelopeMilter(Milter.Base):
                 f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} [{self.id}]"
             )
 
+    def dkim2_seen(self):
+        # a message with no body never reaches body(), and one with no
+        # header fields at all not even eoh()
+        if self.seen is None:
+            self.seen = dkim2hop.Stream(self.fields, self.mail_from, self.mail_to,
+                                        dkim2_dns, arriving=self.dkim2_arriving(),
+                                        may_sign=self.dkim2_may_sign())
+        return self.seen
+
+    def dkim2_verify_arrival(self, queue_id):
+        # mail from outside: the DKIM2 chain it came with was checked against
+        # the envelope it came in as it arrived; say how that went.  Report
+        # only: nothing is refused here, but a chain that did not verify is
+        # not signed on the way out
+        if self.dkim2_off or not self.dkim2_arriving():
+            return None
+        try:
+            result = self.dkim2_seen().result()
+            report = dkim2hop.authentication_results(result, dkim2_authserv_id)
+        except Exception:
+            self.dkim2_give_up("verification")
+            return None
+        logging.info(f"{queue_id} dkim2: arrival {result.status}: "
+                     f"{dkim2hop.clean(result.message)} [{self.id}]")
+        # only we may say how a message arrived
+        stale = sum(1 for f in self.fields if dkim2hop._name(f) == DKIM2_ARRIVAL.lower().encode())
+        for idx in range(stale, 0, -1):
+            self.chgheader(DKIM2_ARRIVAL, idx, None)
+        self.addheader(DKIM2_ARRIVAL, result.status)
+        self.addheader("Authentication-Results", report, 0)
+        return result.status
+
+    def dkim2_arrival(self, verified):
+        # this transaction's verdict, else the one we attached on arrival
+        # (it comes back to us from mailman, which we trust to relay it)
+        if verified is not None:
+            return verified
+        if not self.getsymval('{auth_authen}'):
+            return None
+        for field in self.fields:
+            if dkim2hop._name(field) == DKIM2_ARRIVAL.lower().encode():
+                return dkim2hop.clean(field.split(b":", 1)[1].decode("ascii", "replace"), 20).lower()
+        return None
+
+    def dkim2_wants_new_from(self, hdr_from_addr, env_from_addr):
+        # a list copy we are going to sign needs a From in our own domain
+        # when the body is not the one the last DKIM2 signature covered
+        # (mailman added a footer): we answer for the message then.  A post
+        # nobody signed keeps its From, and so goes out without our
+        # signature unless the DMARC rule rewrites it; a From already ours
+        # is left alone
+        if self.dkim2_off or not dkim2_keydir or self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
+            return False
+        try:
+            return self.dkim2_body_changed(hdr_from_addr, env_from_addr)
+        except Exception:
+            self.dkim2_give_up("the From rule")
+            return False
+
+    def dkim2_body_changed(self, hdr_from_addr, env_from_addr):
+        from_domain = hdr_from_addr.rsplit("@", 1)[-1].lower()
+        if check_local(hdr_from_addr) or from_domain == forwarding_domain.lower():
+            return False
+        if not dkim2hop.find_key(keydir=dkim2_keydir, selector=dkim2_selector,
+                                 domain=env_from_addr.rsplit("@", 1)[-1]):
+            return False
+        return self.dkim2_seen().body_changed_since_signature()
+
+    def dkim2_sign(self, queue_id, exploded):
+        # last of all: record what we changed and sign for the envelope the
+        # message leaves in.  Only mail we relay off-site, and never over a
+        # chain that did not verify when it arrived
+        if self.dkim2_off or not dkim2_keydir or not self.offsite_rcpts():
+            return
+        if self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
+            logging.info(f"{queue_id} dkim2: not signing, arrival was {self.dkim2_arrival_status} [{self.id}]")
+            return
+        mail_from = self.env_from_out or email.utils.parseaddr(self.mail_from)[1]
+        try:
+            signed = dkim2hop.sign(self.dkim2_seen(), self.fields_after_changes(),
+                                   mail_from, self.mail_to, dkim2_keydir,
+                                   exploded=exploded, selector=dkim2_selector)
+        except Exception:
+            self.dkim2_give_up("signing")
+            return
+        if not signed:
+            logging.info(f"{queue_id} dkim2: not signing: {signed.reason} [{self.id}]")
+            return
+        for idx in sorted(signed.delete, reverse=True):
+            self.chgheader("Message-Instance", idx, None)
+        # each goes in at the top, so the last one in is the first field
+        for name, value in reversed(signed.insert):
+            self.addheader(name, value, 0)
+        logging.info(
+            f"{queue_id} dkim2: signed d={signed.domain} for {mail_from} "
+            f"({', '.join(n for n, _v in signed.insert)}) [{self.id}]")
+
     def eom(self):
         queue_id = None
         try:
             queue_id = self.getsymval('i') # queue id
-            logging.debug(
-                f"[{self.id}] Envelope-From: {self.mail_from}, Header-From: {self.header_from or 'N/A'}"
-            )
-
-            logging.debug(
-                f"[{self.id}] Envelope-To: {self.mail_to or 'N/A'}, Header-To: {self.header_to or 'N/A'}"
-            )
-
-            _hdr_from_name, hdr_from_addr = email.utils.parseaddr(self.header_from)
-            env_from_addr = email.utils.parseaddr(self.mail_from)[1]
-            hdr_to_addr = email.utils.parseaddr(self.header_to)
-            # mailman batches mix subscribers, so a wrapped recipient in the
-            # batch must not skip the dmarc check below
-            auth_user = (self.getsymval('{auth_authen}') or '').lower()
-            list_fanout = auth_user == mailman_sasl_user and bool(listbounce_mailmatch.search(env_from_addr))
-
-            # scenario 1
-            if any(is_wrapped(item) for item in self.mail_to):
-                logging.debug(
-                    f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
-                )
-                added = self.unwrap_from_headers(queue_id)
-                # we forward to the unwrapped addresses from our IPs, so the
-                # replier's SPF fails and their DKIM rarely survives the
-                # To:/Cc: rewrite.  Milter changes apply to every copy, so a
-                # local list or ignored recipient alongside is rewritten too
-                # (lmtp_generic_maps restores the From for mailman)
-                if added and not list_fanout:
-                    # a wrapped list bounce may share the message
-                    self.unwrap_list_bounces(queue_id)
-                    self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
-                    return Milter.ACCEPT
-
-            if list_fanout:
-                # a mailman batch mixes subscribers, so decide from the sender:
-                # one local list or alias in the batch must not decide for all
-                self.unwrap_list_bounces(queue_id)
-            elif any(listbounce_mailmatch.search(item) for item in self.mail_to):
-                self.unwrap_list_bounces(queue_id)
-                return Milter.ACCEPT
-
-            # only ignored recipients: nothing to rewrite for.  Alongside
-            # anyone else they are rewritten too, and Postfix's transport
-            # for them restores the original From
-            elif all(is_ignored(k) for k in self.rcpt_keys()):
-                logging.info(
-                    f"{queue_id} none: Envelope To {self.mail_to} are all ignore list entries [{self.id}]"
-                )
-                return Milter.ACCEPT
-
-            # scenario 2
-            # an alias forwards off-site, so it needs the rewrite even when a
-            # list shares the message; lmtp_generic_maps restores the From
-            # on the copy delivered to mailman.  An ignored alias wants the
-            # original From, so it doesn't count
-            elif test_virtual_alias([k for k in self.rcpt_keys() if not is_ignored(k)]):
-                logging.debug(
-                    f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
-                )
-                self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
-                return Milter.ACCEPT
-            # wraps and aliases are handled above, and Postfix only accepts
-            # mailman's addresses or aliases in our domains, so the rest are
-            # delivered to mailman here; a direct off-site recipient still
-            # needs the rewrite below
-            elif not self.offsite_rcpts():
-                logging.info(
-                    f"{queue_id} none: no off-site recipients, no action needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
-                )
-                return Milter.ACCEPT
-            # scenario 3
-            if check_local(env_from_addr) and check_local(hdr_from_addr):
-                logging.info(
-                    f"{queue_id} none: List source, no action needed Envelope-From: {env_from_addr} Header-From: {hdr_from_addr} [{self.id}]"
-                )
-                return Milter.ACCEPT
-            # no scenario match
-            else:
-                logging.debug(f"{queue_id} debug: Fall through [{self.id}]")
-                logging.debug(f"{queue_id} debug: env_from is {env_from_addr} [{self.id}]")
-                logging.debug(f"{queue_id} debug: rewrite_domains are {rewrite_domain_map} [{self.id}]")
-                logging.debug(f"{queue_id} debug: header from name is {_hdr_from_name} [{self.id}]")
-                try:
-                    rewrite_domain = rewrite_domain_map[env_from_addr.rsplit("@", 1)[-1].lower()]
-                except KeyError:
-                    rewrite_domain = forwarding_domain
-                logging.info(f"rewrite domain is {rewrite_domain}")
-                if check_dmarc(hdr_from_addr):
-                    new_hdr_from_addr = wrap_addr(hdr_from_addr, forwarding_domain)
-                    self.change_header_from(_hdr_from_name, new_hdr_from_addr)
-                    # nobody replies to a bounce, so no wrap entry for it
-                    if env_from_addr:
-                        update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
-                    new_env_from = self.change_env_from(env_from_addr, wrap_addr(env_from_addr, rewrite_domain), queue_id)
-                    if internal_addr(new_env_from) != internal_addr(new_hdr_from_addr):
-                        self.log_envelope_wrap(env_from_addr, new_env_from)
-                    logging.info(
-                        f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr or '<>'} to {new_env_from or '<>'} header-From changed from {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
-                    )
-                # SPF is checked on the MAIL FROM domain; we already send for
-                # our local domains, so forwarding can't break theirs
-                elif env_from_addr and not check_local(env_from_addr) and check_spf(env_from_addr):
-                    logging.info(
-                        f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: {env_from_addr or '<>'} [{self.id}]"
-                    )
-                    try:
-                        new_env_from = self.change_env_from(env_from_addr, wrap_addr(env_from_addr, rewrite_domain), queue_id)
-                    except Exception as e:
-                        logging.info(f"{queue_id} error: chgfrom failed: {e} [{self.id}]")
-                    else:
-                        self.log_envelope_wrap(env_from_addr, new_env_from)
-                    return Milter.ACCEPT
-                else:
-                    logging.info(
-                        f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} [{self.id}]"
-                    )
-                return Milter.ACCEPT
-
+            self.dkim2_arrival_status = self.dkim2_arrival(self.dkim2_verify_arrival(queue_id))
+            result = self.rewrite(queue_id)
+            if result in (Milter.ACCEPT, Milter.CONTINUE):
+                auth_user = (self.getsymval('{auth_authen}') or '').lower()
+                env_from_addr = email.utils.parseaddr(self.mail_from)[1]
+                self.dkim2_sign(queue_id, exploded=(
+                    auth_user == mailman_sasl_user
+                    and bool(listbounce_mailmatch.search(env_from_addr))))
+            return result
         except psycopg.OperationalError as e:
             logging.info(f"{queue_id} error: database unavailable: {e} [{self.id}]")
             self.setreply("451", "4.3.0", "backend unavailable")
@@ -625,11 +722,140 @@ class EnvelopeMilter(Milter.Base):
             logging.exception(f"{queue_id} error: unexpected failure [{self.id}]")
             self.setreply("451", "4.3.0", "rewriter internal error")
             return Milter.TEMPFAIL
+
+    def rewrite(self, queue_id):
+        # the address rewriting: returns the milter result.  Errors are
+        # eom()'s to handle
+        logging.debug(
+            f"[{self.id}] Envelope-From: {self.mail_from}, Header-From: {self.header_from or 'N/A'}"
+        )
+
+        logging.debug(
+            f"[{self.id}] Envelope-To: {self.mail_to or 'N/A'}, Header-To: {self.header_to or 'N/A'}"
+        )
+
+        _hdr_from_name, hdr_from_addr = email.utils.parseaddr(self.header_from)
+        env_from_addr = email.utils.parseaddr(self.mail_from)[1]
+        hdr_to_addr = email.utils.parseaddr(self.header_to)
+        # mailman batches mix subscribers, so a wrapped recipient in the
+        # batch must not skip the dmarc check below
+        auth_user = (self.getsymval('{auth_authen}') or '').lower()
+        list_fanout = auth_user == mailman_sasl_user and bool(listbounce_mailmatch.search(env_from_addr))
+
+        # scenario 1
+        if any(is_wrapped(item) for item in self.mail_to):
+            logging.debug(
+                f"debug: Header from: {hdr_from_addr} is remote, Header To: {hdr_to_addr} is wrapped local [{self.id}]"
+            )
+            added = self.unwrap_from_headers(queue_id)
+            # we forward to the unwrapped addresses from our IPs, so the
+            # replier's SPF fails and their DKIM rarely survives the
+            # To:/Cc: rewrite.  Milter changes apply to every copy, so a
+            # local list or ignored recipient alongside is rewritten too
+            # (lmtp_generic_maps restores the From for mailman)
+            if added and not list_fanout:
+                # a wrapped list bounce may share the message
+                self.unwrap_list_bounces(queue_id)
+                self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
+                return Milter.ACCEPT
+
+        if list_fanout:
+            # a mailman batch mixes subscribers, so decide from the sender:
+            # one local list or alias in the batch must not decide for all
+            self.unwrap_list_bounces(queue_id)
+        elif any(listbounce_mailmatch.search(item) for item in self.mail_to):
+            self.unwrap_list_bounces(queue_id)
+            return Milter.ACCEPT
+
+        # only ignored recipients: nothing to rewrite for.  Alongside
+        # anyone else they are rewritten too, and Postfix's transport
+        # for them restores the original From
+        elif all(is_ignored(k) for k in self.rcpt_keys()):
+            logging.info(
+                f"{queue_id} none: Envelope To {self.mail_to} are all ignore list entries [{self.id}]"
+            )
+            return Milter.ACCEPT
+
+        # scenario 2
+        # an alias forwards off-site, so it needs the rewrite even when a
+        # list shares the message; lmtp_generic_maps restores the From
+        # on the copy delivered to mailman.  An ignored alias wants the
+        # original From, so it doesn't count
+        elif test_virtual_alias([k for k in self.rcpt_keys() if not is_ignored(k)]):
+            logging.debug(
+                f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
+            )
+            self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
+            return Milter.ACCEPT
+        # wraps and aliases are handled above, and Postfix only accepts
+        # mailman's addresses or aliases in our domains, so the rest are
+        # delivered to mailman here; a direct off-site recipient still
+        # needs the rewrite below
+        elif not self.offsite_rcpts():
+            logging.info(
+                f"{queue_id} none: no off-site recipients, no action needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
+            )
+            return Milter.ACCEPT
+        # scenario 3
+        if check_local(env_from_addr) and check_local(hdr_from_addr):
+            logging.info(
+                f"{queue_id} none: List source, no action needed Envelope-From: {env_from_addr} Header-From: {hdr_from_addr} [{self.id}]"
+            )
+            return Milter.ACCEPT
+        # no scenario match
+        else:
+            logging.debug(f"{queue_id} debug: Fall through [{self.id}]")
+            logging.debug(f"{queue_id} debug: env_from is {env_from_addr} [{self.id}]")
+            logging.debug(f"{queue_id} debug: rewrite_domains are {rewrite_domain_map} [{self.id}]")
+            logging.debug(f"{queue_id} debug: header from name is {_hdr_from_name} [{self.id}]")
+            try:
+                rewrite_domain = rewrite_domain_map[env_from_addr.rsplit("@", 1)[-1].lower()]
+            except KeyError:
+                rewrite_domain = forwarding_domain
+            logging.info(f"rewrite domain is {rewrite_domain}")
+            if check_dmarc(hdr_from_addr) or (
+                    list_fanout and self.dkim2_wants_new_from(hdr_from_addr, env_from_addr)):
+                new_hdr_from_addr = wrap_addr(hdr_from_addr, forwarding_domain)
+                self.change_header_from(_hdr_from_name, new_hdr_from_addr)
+                # nobody replies to a bounce, so no wrap entry for it
+                if env_from_addr:
+                    update_addr_wrap_log(hdr_from_addr, new_hdr_from_addr)
+                new_env_from = self.change_env_from(env_from_addr, wrap_addr(env_from_addr, rewrite_domain), queue_id)
+                if internal_addr(new_env_from) != internal_addr(new_hdr_from_addr):
+                    self.log_envelope_wrap(env_from_addr, new_env_from)
+                logging.info(
+                    f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr or '<>'} to {new_env_from or '<>'} header-From changed from {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
+                )
+            # SPF is checked on the MAIL FROM domain; we already send for
+            # our local domains, so forwarding can't break theirs
+            elif env_from_addr and not check_local(env_from_addr) and check_spf(env_from_addr):
+                logging.info(
+                    f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: {env_from_addr or '<>'} [{self.id}]"
+                )
+                try:
+                    new_env_from = self.change_env_from(env_from_addr, wrap_addr(env_from_addr, rewrite_domain), queue_id)
+                except Exception as e:
+                    logging.info(f"{queue_id} error: chgfrom failed: {e} [{self.id}]")
+                else:
+                    self.log_envelope_wrap(env_from_addr, new_env_from)
+                return Milter.ACCEPT
+            else:
+                logging.info(
+                    f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} [{self.id}]"
+                )
+            return Milter.ACCEPT
+
         return Milter.CONTINUE
 
 
 def main():
     timeout = 600
+
+    # without DKIM2 nothing here reads the body: ask the MTA not to send it
+    nocallback = getattr(Milter, "nocallback", None)
+    if nocallback and not (dkim2_keydir or dkim2_authserv_id):
+        EnvelopeMilter.eoh = nocallback(EnvelopeMilter.eoh)
+        EnvelopeMilter.body = nocallback(EnvelopeMilter.body)
 
     Milter.factory = EnvelopeMilter
     Milter.set_flags(Milter.ADDHDRS | Milter.CHGFROM | Milter.CHGHDRS | Milter.ADDRCPT | Milter.DELRCPT)

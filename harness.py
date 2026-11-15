@@ -685,6 +685,10 @@ def main(argv=None):
             tx.c(f"{k}: {v}")
             m.header(k, v)
         tx.c("", *body, ".")
+        if hasattr(m, "eoh"):
+            m.eoh()
+        if hasattr(m, "body"):
+            m.body("".join(f"{line}\r\n" for line in body).encode())
         tx.milter(f"header() x{len(headers)}, eoh(), body()")
         try:
             result = code_name(m.eom())
