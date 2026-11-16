@@ -41,12 +41,21 @@ mailman_sasl_user = os.environ.get("MAILMAN_SASL_USER", "mailman@ietf.org").lowe
 dkim2_keydir = os.environ.get("DKIM2_KEYDIR", "")
 dkim2_selector = os.environ.get("DKIM2_SELECTOR", "")
 dkim2_authserv_id = os.environ.get("DKIM2_AUTHSERV_ID", "")
+# DKIM2_SIGN_DAEMON: split then sign.  Postfix sends each off-site copy,
+#   one recipient at a time, back through a loopback listener whose
+#   milter_macro_daemon_name is this; mail is signed there and only there.
+#   Every other listener rewrites and records, and never signs.  Unset,
+#   mail is signed in the transaction that relays it off-site
+dkim2_sign_daemon = os.environ.get("DKIM2_SIGN_DAEMON", "")
 # where keys are looked up: None is the DNS; the tests give a table
 dkim2_dns = None
 # how the chain a message arrived with checked out, carried through mailman
 # to the fan-out; set here on arrival, and never taken from outside
 DKIM2_ARRIVAL = "X-DKIM2-Arrival"
 DKIM2_NOT_VERIFIED = ("fail", "permerror", "temperror")
+# a list's fan-out, marked for the signing pass, which removes it; X- fields
+# are not hashed by DKIM2, so neither changes a signature
+DKIM2_EXPLODED = "X-DKIM2-Exploded"
 
 _policy_cache = ExpiringDict(max_len=50000, max_age_seconds=1800)
 
@@ -353,6 +362,8 @@ class EnvelopeMilter(Milter.Base):
         self.env_from_out = None
         self.dkim2_arrival_status = None
         self.dkim2_off = False
+        self.dkim2_signing = False
+        self.exploded_marks = 0
 
     def envfrom(self, f, *str):
         # one milter instance serves every message on an SMTP connection
@@ -367,6 +378,11 @@ class EnvelopeMilter(Milter.Base):
         self.env_from_out = None
         self.dkim2_arrival_status = None
         self.dkim2_off = False
+        self.exploded_marks = 0
+        # {daemon_name} is a connect macro, so it holds for every message
+        # on the connection; a listener that does not name itself never signs
+        self.dkim2_signing = bool(dkim2_sign_daemon) and (
+            self.getsymval('{daemon_name}') == dkim2_sign_daemon)
         # addresses keep their case: local parts (SRS, VERP) can be case
         # sensitive and delrcpt() must name the recipient exactly as given;
         # internal_addr() gives the lowercased form for comparisons
@@ -419,6 +435,8 @@ class EnvelopeMilter(Milter.Base):
             self.header_to = value
         if name.lower() in ("to", "cc"):
             self.addr_headers.append((name, value))
+        if name.lower() == DKIM2_EXPLODED.lower():
+            self.exploded_marks += 1
         if (dkim2_keydir or dkim2_authserv_id) and not self.dkim2_off:
             try:
                 self.fields.append(dkim2hop.header_field(name, value))
@@ -427,15 +445,17 @@ class EnvelopeMilter(Milter.Base):
         return Milter.CONTINUE
 
     def dkim2_arriving(self):
-        # mail from outside, whose chain we verify against its envelope
-        return bool(dkim2_authserv_id) and not self.getsymval('{auth_authen}')
+        # mail from outside, whose chain we verify against its envelope.
+        # The signing pass only ever gets mail that has been through us
+        return (bool(dkim2_authserv_id) and not self.dkim2_signing
+                and not self.getsymval('{auth_authen}'))
 
     def dkim2_may_sign(self):
         # will the body's hash be wanted?  It is if we may sign (only mail
         # we relay off-site is; unwrapping does not change this, a wrapped
         # recipient is already an off-site one) or may have a header change
         # to record: those are made for off-site recipients and for aliases
-        if self.offsite_rcpts():
+        if self.dkim2_signing or self.offsite_rcpts():
             return True
         return test_virtual_alias([k for k in self.rcpt_keys() if not is_ignored(k)])
 
@@ -645,6 +665,9 @@ class EnvelopeMilter(Milter.Base):
             return verified
         if not self.getsymval('{auth_authen}'):
             return None
+        return self.dkim2_arrival_field()
+
+    def dkim2_arrival_field(self):
         for field in self.fields:
             if dkim2hop._name(field) == DKIM2_ARRIVAL.lower().encode():
                 return dkim2hop.clean(field.split(b":", 1)[1].decode("ascii", "replace"), 20).lower()
@@ -687,6 +710,14 @@ class EnvelopeMilter(Milter.Base):
         # last of all: sign for the envelope the message leaves in, or at
         # least say what we changed.  Only mail we relay off-site is
         # signed, and never over a chain that did not verify when it arrived
+        if dkim2_sign_daemon:
+            # split then sign: the signing pass signs each copy for its
+            # one recipient.  Say whether it is one of a list's many
+            if exploded and not self.exploded_marks:
+                self.addheader(DKIM2_EXPLODED, "yes")
+            if not self.dkim2_off:
+                self.dkim2_record(queue_id)
+            return
         if self.dkim2_off:
             return
         if dkim2_keydir and self.offsite_rcpts():
@@ -716,6 +747,26 @@ class EnvelopeMilter(Milter.Base):
             f"({', '.join(n for n, _v in signed.insert)}) [{self.id}]")
         return True
 
+    def dkim2_sign_copy(self, queue_id):
+        # the signing pass: one copy, one recipient, already rewritten and
+        # recorded by the first pass.  Sign it as it is and change nothing
+        # else; no lookups, and never a reason to hold the mail
+        try:
+            if not self.dkim2_off and dkim2_keydir and self.offsite_rcpts():
+                # set only by the first pass (which replaces one from
+                # outside) or by mailman, which we trust to relay it
+                self.dkim2_arrival_status = self.dkim2_arrival_field()
+                if self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
+                    logging.info(f"{queue_id} dkim2 sign pass: not signing, arrival was "
+                                 f"{self.dkim2_arrival_status} [{self.id}]")
+                else:
+                    self.dkim2_signed(queue_id, exploded=self.exploded_marks > 0)
+            for idx in range(self.exploded_marks, 0, -1):
+                self.chgheader(DKIM2_EXPLODED, idx, None)
+        except Exception:
+            logging.exception(f"{queue_id} dkim2 sign pass: error, sending it on unsigned [{self.id}]")
+        return Milter.ACCEPT
+
     def dkim2_record(self, queue_id):
         # we are not signing, but we may have changed header fields DKIM2
         # hashes (To and Cc unwrapped; From, for an alias).  Always say so,
@@ -743,6 +794,8 @@ class EnvelopeMilter(Milter.Base):
         queue_id = None
         try:
             queue_id = self.getsymval('i') # queue id
+            if self.dkim2_signing:
+                return self.dkim2_sign_copy(queue_id)
             self.dkim2_arrival_status = self.dkim2_arrival(self.dkim2_verify_arrival(queue_id))
             result = self.rewrite(queue_id)
             if result in (Milter.ACCEPT, Milter.CONTINUE):
