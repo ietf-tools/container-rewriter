@@ -5,8 +5,6 @@ name: Build multi arch Docker Image with separate Github Runners
 on:
   workflow_dispatch:
   push:
-    branches:
-      - "*"
     tags:
       - "*"
     paths:
