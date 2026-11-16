@@ -67,6 +67,10 @@ spec:
             - name: DKIM2_SIGN_DAEMON
               value: {{ .signDaemon | quote }}
             {{- end }}
+            {{- if .listVerp }}
+            - name: LIST_VERP
+              value: "yes"
+            {{- end }}
             {{- end }}
             - name: DB_HOST
               valueFrom:
