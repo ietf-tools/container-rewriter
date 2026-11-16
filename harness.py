@@ -542,6 +542,9 @@ def build_parser():
                    help="envelope sender (MAIL FROM); default: the --from address, or "
                         "<list>-bounces@<domain> for a fan-out. Use '' for the null sender <>")
     p.add_argument("--auth", help="override the SASL user ({auth_authen})")
+    p.add_argument("--daemon", default=None, metavar="NAME",
+                   help="the listener's milter_macro_daemon_name ({daemon_name}); "
+                        "DKIM2_SIGN_DAEMON's value selects the signing pass")
     p.add_argument("--virtual", action="append", default=[], metavar="ADDR",
                    help="address present in the virtual table (aliases and valid wraps)")
     p.add_argument("--ignore", action="append", metavar="ADDR",
@@ -605,7 +608,7 @@ def main(argv=None):
     recipients = recipients + args.cc + args.bcc
     env_from = args.env_from.strip("<>") if args.env_from is not None else default_env_from
 
-    ctx = FakeCtx({"i": QUEUE_ID, "{auth_authen}": auth or None})
+    ctx = FakeCtx({"i": QUEUE_ID, "{auth_authen}": auth or None, "{daemon_name}": args.daemon})
     m = rewriter.EnvelopeMilter()
     if hasattr(m, "_setctx"):
         m._setctx(ctx)

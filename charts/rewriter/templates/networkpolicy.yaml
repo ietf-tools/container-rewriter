@@ -1,0 +1,28 @@
+{{- with .Values.rewriter.networkPolicy }}
+{{- if .enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ template "rewriter.name" $ }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "rewriter.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rewriter.selectorLabels" $ | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # the milter: the Postfix pods only
+    - from:
+        {{- toYaml .milterFrom | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 8800
+    # health checks, from the kubelet
+    - ports:
+        - protocol: TCP
+          port: 8000
+{{- end }}
+{{- end }}

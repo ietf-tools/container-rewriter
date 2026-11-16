@@ -63,6 +63,10 @@ spec:
               value: {{ .selector | quote }}
             {{- end }}
             {{- end }}
+            {{- if .signDaemon }}
+            - name: DKIM2_SIGN_DAEMON
+              value: {{ .signDaemon | quote }}
+            {{- end }}
             {{- end }}
             - name: DB_HOST
               valueFrom:
