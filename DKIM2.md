@@ -164,6 +164,7 @@ unknown `X-` fields through.
 | `DKIM2_AUTHSERV_ID` | Turns on verification of arriving mail, and is the name the result is reported under. See below. |
 | `DKIM2_KEYDIR` | Turns on signing. A directory with one sub-directory per signing domain. |
 | `DKIM2_SELECTOR` | The selector to sign with: the key is `<DKIM2_KEYDIR>/<signing domain>/<DKIM2_SELECTOR>.key`. If unset, the newest `.key` file in the domain's directory is used, and its name is the selector. See below. |
+| `DKIM2_SIGN_DAEMON` | Split then sign. Mail is signed only on connections whose `{daemon_name}` macro equals this; everything else is rewritten and recorded, never signed. Unset, mail is signed in the transaction that relays it off-site. See below. |
 
 `DKIM2_AUTHSERV_ID` is the *authserv-id* of RFC 8601: the first thing in an
 `Authentication-Results` field, naming the system that did the checking.
@@ -240,6 +241,29 @@ a Secret, for example:
 ```
 
 with the Secret holding one item named `<selector>.key`.
+
+### Split then sign
+
+A signature names every envelope recipient of its transaction (`rt=`), and
+the milter sees recipients before Postfix expands aliases. With
+`DKIM2_SIGN_DAEMON` set, signing moves to a second pass after expansion:
+Postfix sends each off-site copy, one recipient per transaction, to a
+loopback listener with `-o milter_macro_daemon_name=<DKIM2_SIGN_DAEMON>`
+and this milter, and on to the relay by `content_filter`
+(`docs/superpowers/specs/2026-11-15-dkim2-split-then-sign-design.md`).
+
+- **Every other listener** verifies, rewrites and records as above, and
+  never signs. A list fan-out gets `X-DKIM2-Exploded: yes`.
+- **The signing listener** changes nothing but this: it signs over the
+  chain as received (`X-DKIM2-Arrival` says how it arrived; a failed
+  arrival is not signed), with `f=exploded` when `X-DKIM2-Exploded` is
+  there, and removes `X-DKIM2-Exploded`. No address rewriting, DNS policy
+  lookups or database queries.
+
+Only the Postfix pods may reach the milter port: the mode is a claim made by
+the milter client (`rewriter.networkPolicy` in the chart). Turn it on in
+the rewriter before Postfix sends the second pass, and off after: then no
+copy is ever signed twice.
 
 ## Where the rewriter sits among the other milters
 

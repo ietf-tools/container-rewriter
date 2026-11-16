@@ -33,6 +33,20 @@ rewriter:
     keys: []
     #  - domain: ietf.org
     #    existingSecretName: rewriter-dkim2-ietf-org
+    # split then sign: the milter_macro_daemon_name of the Postfix listener
+    # that sends each off-site copy back, one recipient at a time, to be
+    # signed (Postfix's dkim2Split). Only that listener's mail is signed;
+    # empty signs in the transaction that relays the mail off-site
+    signDaemon: ""
+  # only the Postfix pods may reach the milter port (the signing pass is
+  # chosen by a macro the milter client sends); the health port stays open
+  # to the kubelet
+  networkPolicy:
+    enabled: false
+    milterFrom:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/name: postfix
   database:
     host:
       existingSecretName: db-app
