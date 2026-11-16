@@ -38,6 +38,9 @@ rewriter:
     # signed (Postfix's dkim2Split). Only that listener's mail is signed;
     # empty signs in the transaction that relays the mail off-site
     signDaemon: ""
+    # with signDaemon: give each list copy mailman's VERP envelope sender
+    # (<list>-bounces+<local>=<domain>@), so bounces name the subscriber
+    listVerp: false
   # only the Postfix pods may reach the milter port (the signing pass is
   # chosen by a macro the milter client sends); the health port stays open
   # to the kubelet

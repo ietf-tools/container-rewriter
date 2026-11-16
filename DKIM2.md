@@ -165,6 +165,7 @@ unknown `X-` fields through.
 | `DKIM2_KEYDIR` | Turns on signing. A directory with one sub-directory per signing domain. |
 | `DKIM2_SELECTOR` | The selector to sign with: the key is `<DKIM2_KEYDIR>/<signing domain>/<DKIM2_SELECTOR>.key`. If unset, the newest `.key` file in the domain's directory is used, and its name is the selector. See below. |
 | `DKIM2_SIGN_DAEMON` | Split then sign. Mail is signed only on connections whose `{daemon_name}` macro equals this; everything else is rewritten and recorded, never signed. Unset, mail is signed in the transaction that relays it off-site. See below. |
+| `LIST_VERP` | With `DKIM2_SIGN_DAEMON`: the signing pass gives each list copy mailman's VERP envelope sender, `<list>-bounces+<local>=<domain>@`, so a bounce names the subscriber. `yes` to turn on. See below. |
 
 `DKIM2_AUTHSERV_ID` is the *authserv-id* of RFC 8601: the first thing in an
 `Authentication-Results` field, naming the system that did the checking.
@@ -259,6 +260,20 @@ and this milter, and on to the relay by `content_filter`
   arrival is not signed), with `f=exploded` when `X-DKIM2-Exploded` is
   there, and removes `X-DKIM2-Exploded`. No address rewriting, DNS policy
   lookups or database queries.
+
+With `LIST_VERP` on, the signing listener also changes a list's
+`-bounces` envelope sender (wrapped by the DMARC rule or not) to mailman's
+VERP form for the copy's one recipient, before signing for it:
+`ietf-bounces@ietf.org` becomes `ietf-bounces+sub=example.net@ietf.org`,
+and `ietf-bounces=40ietf.org@dmarc.ietf.org` becomes
+`ietf-bounces+sub=example.net=40ietf.org@dmarc.ietf.org`. Only our own
+lists: the list's domain must be in `LOCAL_DOMAINS` (and a wrap's domain in
+`REWRITE_DOMAINS`), so another organisation's list post forwarded through
+one of our aliases keeps its sender. Recipients that
+mailman's `verp_regexp` would not read back (an `=` in the local part, a
+quoted or non-ASCII address) keep the plain sender. A bounce to a wrapped
+list address is unwrapped in `To:` and `Cc:` as well as in the envelope,
+since mailman reads the VERP address from `To:`.
 
 Only the Postfix pods may reach the milter port: the mode is a claim made by
 the milter client (`rewriter.networkPolicy` in the chart). Turn it on in

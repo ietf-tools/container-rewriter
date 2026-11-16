@@ -47,6 +47,10 @@ dkim2_authserv_id = os.environ.get("DKIM2_AUTHSERV_ID", "")
 #   Every other listener rewrites and records, and never signs.  Unset,
 #   mail is signed in the transaction that relays it off-site
 dkim2_sign_daemon = os.environ.get("DKIM2_SIGN_DAEMON", "")
+# LIST_VERP: in the signing pass (DKIM2_SIGN_DAEMON), give each list copy
+#   an envelope sender in mailman's VERP format, <list>-bounces+<local>=
+#   <domain>@, so a bounce names the subscriber it is for
+list_verp = os.environ.get("LIST_VERP", "").lower() in ("1", "yes", "true", "on")
 # where keys are looked up: None is the DNS; the tests give a table
 dkim2_dns = None
 # how the chain a message arrived with checked out, carried through mailman
@@ -294,13 +298,15 @@ def unwrap_addr(addr):
     user, sep, orig_domain = unquote_local(local).rpartition('=40')
     return f"{quote_local(user)}@{orig_domain}" if sep else addr
 
-def unwrap_header_addrs(value):
+def unwrap_header_addrs(value, wrapped=None):
     # an address-list header (To:, Cc:) with our wrapped addresses unwrapped,
-    # or None if it has none; display names are kept
+    # or None if it has none; display names are kept.  wrapped says which
+    # addresses are ours to unwrap (default: is_wrapped)
+    wrapped = wrapped or is_wrapped
     pairs = [(name, addr) for name, addr in email.utils.getaddresses([value]) if addr]
-    if not any(is_wrapped(addr) for _name, addr in pairs):
+    if not any(wrapped(addr) for _name, addr in pairs):
         return None
-    addrs = [format_from_header(name, unwrap_addr(addr) if is_wrapped(addr) else addr)
+    addrs = [format_from_header(name, unwrap_addr(addr) if wrapped(addr) else addr)
              for name, addr in pairs]
     # RFC 5322 2.1.1: fold between addresses to keep lines short
     lines = [addrs[0]]
@@ -328,6 +334,42 @@ def is_wrapped(addr):
     # list bounces are wrapped too, but unwrap_list_bounces() handles those
     key = internal_addr(addr)
     return bool(wrapped_mailmatch.search(key)) and not listbounce_mailmatch.search(key)
+
+def is_wrapped_list_bounce(addr):
+    # a list's -bounces address (VERP or not) wrapped by us on the way out:
+    # list-bounces[+sub=domain]=40list.domain@dmarc.domain
+    if not listbounce_mailmatch.search(addr):
+        return False
+    local, _, domain = internal_addr(addr).rpartition('@')
+    return domain in rewrite_domain_reverse_map and '=40' in local
+
+# a recipient that needs no quoting and reads back the same from mailman's
+# verp_regexp: no "=" in the local part, an ASCII domain
+_verp_local = re.compile(r"[A-Za-z0-9!#$%&'*+/?^_`{|}~.-]+")
+_verp_domain = re.compile(r"[A-Za-z0-9.-]+")
+
+def verp_sender(env_from, rcpt):
+    # mailman's verp_format, ${bounces}+${local}=${domain}, for a list's
+    # plain -bounces sender (wrapped by us or not); None if this is not one,
+    # or the recipient would not parse back out of it (mailman's
+    # verp_regexp takes the local part up to the first "=").  Only our own
+    # lists: another organisation's list post, forwarded through one of
+    # our aliases, keeps its sender
+    local, _, domain = env_from.rpartition('@')
+    bounces, wrap, list_domain = unquote_local(local).partition('=40')
+    if not re.fullmatch(r"[^@+=]+-bounces", bounces, re.IGNORECASE):
+        return None
+    if wrap:
+        if domain.lower() not in rewrite_domain_reverse_map or not check_local(list_domain):
+            return None
+    elif not check_local(domain):
+        return None
+    rlocal, _, rdomain = rcpt.rpartition('@')
+    if not (_verp_local.fullmatch(rlocal) and _verp_domain.fullmatch(rdomain)):
+        return None
+    if wrap:
+        return wrap_addr(f"{bounces}+{rlocal}={rdomain}@{list_domain}", domain)
+    return f"{bounces}+{rlocal}={rdomain}@{domain}"
 
 def check_local(email_addr):
     local_domain_list = local_domains.split(" ")
@@ -364,6 +406,7 @@ class EnvelopeMilter(Milter.Base):
         self.dkim2_off = False
         self.dkim2_signing = False
         self.exploded_marks = 0
+        self.addr_headers_unwrapped = False
 
     def envfrom(self, f, *str):
         # one milter instance serves every message on an SMTP connection
@@ -379,6 +422,7 @@ class EnvelopeMilter(Milter.Base):
         self.dkim2_arrival_status = None
         self.dkim2_off = False
         self.exploded_marks = 0
+        self.addr_headers_unwrapped = False
         # {daemon_name} is a connect macro, so it holds for every message
         # on the connection; a listener that does not name itself never signs
         self.dkim2_signing = bool(dkim2_sign_daemon) and (
@@ -550,8 +594,7 @@ class EnvelopeMilter(Milter.Base):
         for i, addr in enumerate(self.mail_to):
             if not listbounce_mailmatch.search(addr):
                 continue
-            local, domain = internal_addr(addr).rsplit('@', 1)
-            if domain not in rewrite_domain_reverse_map or '=40' not in local:
+            if not is_wrapped_list_bounce(addr):
                 logging.info(f"{queue_id} none: list bounce already unwrapped {addr} [{self.id}]")
                 continue
             unwrapped_addr = unwrap_addr(addr)
@@ -559,6 +602,7 @@ class EnvelopeMilter(Milter.Base):
             self.delrcpt(addr)
             self.addrcpt(f"<{unwrapped_addr}>")
             self.mail_to[i] = unwrapped_addr
+            self.unwrap_addr_headers(queue_id)
 
     def unwrap_from_headers(self, queue_id):
         # the wrapped envelope recipients are delivered to their original
@@ -590,15 +634,27 @@ class EnvelopeMilter(Milter.Base):
             logging.info(f"{queue_id} unwrap: recipient {addr} added [{self.id}]")
         self.mail_to = keep + added
 
+        self.unwrap_addr_headers(queue_id)
+        return added
+
+    def unwrap_addr_headers(self, queue_id):
+        # our wraps in To:/Cc: shown unwrapped: a person's, and a list's
+        # -bounces address, which a bounce carries in To: and mailman reads
+        # its VERP from.  Once per message: each header is changed from its
+        # value as it arrived
+        if self.addr_headers_unwrapped:
+            return
+        self.addr_headers_unwrapped = True
+        def ours(addr):
+            return is_wrapped(addr) or is_wrapped_list_bounce(addr)
         # chgheader() counts from 1 among headers of the same name
         counts = {}
         for name, value in self.addr_headers:
             idx = counts[name.lower()] = counts.get(name.lower(), 0) + 1
-            new_value = unwrap_header_addrs(value)
+            new_value = unwrap_header_addrs(value, ours)
             if new_value is not None:
                 self.change_header(name, idx, new_value)
                 logging.info(f"{queue_id} unwrap: header-{name} changed from {value} to {new_value} [{self.id}]")
-        return added
 
     def rewrite_forwarded(self, hdr_from_name, hdr_from_addr, env_from_addr, queue_id):
         # a message we pass on from someone else's domain (alias forward,
@@ -752,6 +808,7 @@ class EnvelopeMilter(Milter.Base):
         # recorded by the first pass.  Sign it as it is and change nothing
         # else; no lookups, and never a reason to hold the mail
         try:
+            self.verp(queue_id)
             if not self.dkim2_off and dkim2_keydir and self.offsite_rcpts():
                 # set only by the first pass (which replaces one from
                 # outside) or by mailman, which we trust to relay it
@@ -766,6 +823,22 @@ class EnvelopeMilter(Milter.Base):
         except Exception:
             logging.exception(f"{queue_id} dkim2 sign pass: error, sending it on unsigned [{self.id}]")
         return Milter.ACCEPT
+
+    def verp(self, queue_id):
+        # one copy for one recipient: a list's -bounces sender becomes the
+        # VERP address for that recipient, before it is signed for.  Any
+        # failure leaves the sender as it was
+        if not list_verp or len(self.mail_to) != 1:
+            return
+        env_from = email.utils.parseaddr(self.mail_from)[1]
+        try:
+            new_env_from = verp_sender(env_from, self.mail_to[0])
+            if new_env_from:
+                self.chgfrom(new_env_from)
+                self.env_from_out = new_env_from
+                logging.info(f"{queue_id} verp: Envelope-From changed from {env_from} to {new_env_from} [{self.id}]")
+        except Exception:
+            logging.exception(f"{queue_id} verp: error, Envelope-From left as {env_from} [{self.id}]")
 
     def dkim2_record(self, queue_id):
         # we are not signing, but we may have changed header fields DKIM2
