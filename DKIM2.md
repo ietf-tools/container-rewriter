@@ -55,8 +55,8 @@ setting on, the rewriter says so in `Message-Instance` fields. Its header
 changes apply to every copy of a message, including ones it will not sign:
 To and Cc are shown unwrapped on a reply to a wrapped address whether or
 not anything makes it take the envelope over; From is wrapped for an alias,
-which is a local recipient; the chain may have failed on arrival; there may
-be no key directory at all. In each case the change is recorded:
+which is a local recipient; the chain may have failed on arrival. In each
+case the change is recorded:
 
 - a message that has `Message-Instance` fields gets the next one, with the
   Recipe that undoes the change;
@@ -70,6 +70,16 @@ with mailman's and its own. A copy that leaves us with unsigned instances
 (the reply forwarded to the unwrapped address) will not verify at the next
 hop. It would not have with the change unrecorded either, and this way the
 message says what was done to it.
+
+**With no key directory at all** (`DKIM2_KEYDIR` unset), nothing the
+rewriter sends on will ever be signed, so nothing is recorded. A message it
+relays off-site, or whose hashed header fields it changes, has every
+`DKIM2-Signature` and `Message-Instance` field removed instead, and is
+logged as `dkim2: no signing keys, removed N DKIM2 header fields`. It
+leaves with no DKIM2 chain at all (NONE at the next hop) rather than one
+that fails (draft-ietf-dkim-dkim2-spec-09 sections 13.1 and 14.2). The
+signing pass does the same to every copy. A message delivered unchanged to
+a local list keeps its chain for mailman.
 
 ## What it relies on
 
