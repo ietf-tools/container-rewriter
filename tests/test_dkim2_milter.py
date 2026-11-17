@@ -305,13 +305,13 @@ def test_unwrapped_to_on_an_unsigned_post_is_recorded_too(dkim2, keys, our_key_o
     assert WRAP in recipe
 
 
-def test_changes_are_recorded_with_verification_only(dkim2, keys, our_key_only, monkeypatch):
-    """No key directory at all: nothing is ever signed, and the change is
-    still recorded."""
+def test_with_verification_only_the_chain_is_removed(dkim2, keys, our_key_only, monkeypatch):
+    """No key directory at all: nothing is ever signed, so a change is not
+    recorded and the chain it would break is removed (test_dkim2_keyless)."""
     monkeypatch.setattr(dkim2, "dkim2_keydir", None)
     sent = send(dkim2, our_key_only, BODY, AUTHOR, [LIST, WRAP])
-    assert len(sent.named("DKIM2-Signature")) == 1
-    assert versions(sent) == ["2", "1"]
+    assert sent.named("DKIM2-Signature") == []
+    assert versions(sent) == []
 
 
 def test_from_taken_over_for_an_alias_is_recorded(dkim2, keys, monkeypatch):

@@ -60,6 +60,8 @@ DKIM2_NOT_VERIFIED = ("fail", "permerror", "temperror")
 # a list's fan-out, marked for the signing pass, which removes it; X- fields
 # are not hashed by DKIM2, so neither changes a signature
 DKIM2_EXPLODED = "X-DKIM2-Exploded"
+# the fields that make up a DKIM2 chain
+DKIM2_CHAIN_FIELDS = ("dkim2-signature", "message-instance")
 
 _policy_cache = ExpiringDict(max_len=50000, max_age_seconds=1800)
 
@@ -406,6 +408,7 @@ class EnvelopeMilter(Milter.Base):
         self.dkim2_off = False
         self.dkim2_signing = False
         self.exploded_marks = 0
+        self.dkim2_chain_fields = {}
         self.addr_headers_unwrapped = False
 
     def envfrom(self, f, *str):
@@ -422,6 +425,7 @@ class EnvelopeMilter(Milter.Base):
         self.dkim2_arrival_status = None
         self.dkim2_off = False
         self.exploded_marks = 0
+        self.dkim2_chain_fields = {}
         self.addr_headers_unwrapped = False
         # {daemon_name} is a connect macro, so it holds for every message
         # on the connection; a listener that does not name itself never signs
@@ -481,6 +485,8 @@ class EnvelopeMilter(Milter.Base):
             self.addr_headers.append((name, value))
         if name.lower() == DKIM2_EXPLODED.lower():
             self.exploded_marks += 1
+        if name.lower() in DKIM2_CHAIN_FIELDS:
+            self.dkim2_chain_fields[name] = self.dkim2_chain_fields.get(name, 0) + 1
         if (dkim2_keydir or dkim2_authserv_id) and not self.dkim2_off:
             try:
                 self.fields.append(dkim2hop.header_field(name, value))
@@ -766,6 +772,13 @@ class EnvelopeMilter(Milter.Base):
         # last of all: sign for the envelope the message leaves in, or at
         # least say what we changed.  Only mail we relay off-site is
         # signed, and never over a chain that did not verify when it arrived
+        if not dkim2_keydir:
+            # nothing will sign over a change or a new recipient, so the
+            # chain would not verify at the next hop: start it again instead.
+            # Mail for a local list, unchanged, keeps it for mailman
+            if self.offsite_rcpts() or self.header_changes:
+                self.dkim2_strip(queue_id)
+            return
         if dkim2_sign_daemon:
             # split then sign: the signing pass signs each copy for its
             # one recipient.  Say whether it is one of a list's many
@@ -809,7 +822,9 @@ class EnvelopeMilter(Milter.Base):
         # else; no lookups, and never a reason to hold the mail
         try:
             self.verp(queue_id)
-            if not self.dkim2_off and dkim2_keydir and self.offsite_rcpts():
+            if not dkim2_keydir:
+                self.dkim2_strip(queue_id)
+            elif not self.dkim2_off and self.offsite_rcpts():
                 # set only by the first pass (which replaces one from
                 # outside) or by mailman, which we trust to relay it
                 self.dkim2_arrival_status = self.dkim2_arrival_field()
@@ -839,6 +854,19 @@ class EnvelopeMilter(Milter.Base):
                 logging.info(f"{queue_id} verp: Envelope-From changed from {env_from} to {new_env_from} [{self.id}]")
         except Exception:
             logging.exception(f"{queue_id} verp: error, Envelope-From left as {env_from} [{self.id}]")
+
+    def dkim2_strip(self, queue_id):
+        # no key to sign with: remove the whole chain, which leaves a
+        # message with no DKIM2 at all rather than one that fails
+        # (draft-ietf-dkim-dkim2-spec-09 13.1, 14.2).  Each field is
+        # removed by its index among those of its name, last first
+        removed = 0
+        for name, count in self.dkim2_chain_fields.items():
+            for idx in range(count, 0, -1):
+                self.chgheader(name, idx, None)
+                removed += 1
+        if removed:
+            logging.info(f"{queue_id} dkim2: no signing keys, removed {removed} DKIM2 header fields [{self.id}]")
 
     def dkim2_record(self, queue_id):
         # we are not signing, but we may have changed header fields DKIM2
