@@ -53,17 +53,18 @@ dkim2_sign_daemon = os.environ.get("DKIM2_SIGN_DAEMON", "")
 list_verp = os.environ.get("LIST_VERP", "").lower() in ("1", "yes", "true", "on")
 
 
-def munge_from_setting(value):
-    # on unless it says otherwise: unset or empty keeps today's behaviour
-    return (value or "").strip().lower() not in ("no", "false", "0", "off")
+def alias_dkim2_setting(value):
+    return (value or "").strip().lower() in ("yes", "true", "1", "on")
 
 
-# DKIM1_MUNGE_FROM: take over the From of a sender whose domain publishes
-#   DMARC p=reject or p=quarantine (the DKIM1-era "munge").  On by default.
-#   Off (no, false, 0 or off), From is rewritten only for DKIM2, by the list
-#   From rule; mail DKIM2 does not cover keeps the author's From and may
-#   fail DMARC at receivers that do not understand DKIM2
-dkim1_munge_from = munge_from_setting(os.environ.get("DKIM1_MUNGE_FROM"))
+# ALIAS_DKIM2: let an alias forward (or a reply to a wrapped address) take
+#   the DKIM2 path instead of the DMARC rule's From: when the message came
+#   with a DKIM2 chain that verified and our signature can extend it (our
+#   forwarding domain matches the alias's, and we hold its key), From is
+#   kept and only the envelope becomes FORWARDING_ADDR.  Off by default.
+#   For an alias address it needs DKIM2_SIGN_DAEMON: in a single pass the
+#   rewriter never sees the off-site copy Postfix makes
+alias_dkim2 = alias_dkim2_setting(os.environ.get("ALIAS_DKIM2"))
 # where keys are looked up: None is the DNS; the tests give a table
 dkim2_dns = None
 # how the chain a message arrived with checked out, carried through mailman
@@ -691,9 +692,16 @@ class EnvelopeMilter(Milter.Base):
         # a message we pass on from someone else's domain (alias forward,
         # reply to a wrapped address): take over a p=reject/quarantine From,
         # or just the envelope when only SPF would fail
-        if not dkim1_munge_from:
-            logging.debug(f"{queue_id} debug: DKIM1_MUNGE_FROM is off, From not rewritten for DMARC [{self.id}]")
-        if dkim1_munge_from and check_dmarc(hdr_from_addr):
+        if self.dkim2_alias_path(env_from_addr):
+            # our signature will extend the sender's chain: From stays the
+            # author's, and only the envelope (our mf=) becomes ours
+            logging.debug(f"{queue_id} debug: on the DKIM2 path, From not rewritten for DMARC [{self.id}]")
+            logging.info(
+                f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} "
+                f"Envelope-From: {env_from_addr or '<>'} [{self.id}]"
+            )
+            self.change_env_from(env_from_addr, forwarding_addr, queue_id)
+        elif check_dmarc(hdr_from_addr):
             new_hdr_from_addr = wrap_addr(hdr_from_addr, forwarding_domain)
             # nobody replies to a bounce, so no wrap entry for it
             if env_from_addr:
@@ -762,14 +770,51 @@ class EnvelopeMilter(Milter.Base):
                 return dkim2hop.clean(field.split(b":", 1)[1].decode("ascii", "replace"), 20).lower()
         return None
 
+    def dkim2_list_path(self, env_from_addr, list_fanout):
+        # will DKIM2 answer for this list copy?  Mailman recorded what it
+        # changed, we hold a key for the envelope domain, the arrival did
+        # not fail and the chain verifies: then we sign it, and the DMARC
+        # rule's From would add nothing.  Anything else falls back to it
+        if not (list_fanout and self.list_instance()) or self.dkim2_off or not dkim2_keydir:
+            return False
+        if self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
+            return False
+        try:
+            if not dkim2hop.find_key(keydir=dkim2_keydir, selector=dkim2_selector,
+                                     domain=env_from_addr.rsplit("@", 1)[-1]):
+                return False
+            return self.dkim2_seen().result().status == "pass"
+        except Exception:
+            return False
+
+    def dkim2_alias_path(self, env_from_addr):
+        # ALIAS_DKIM2: will our signature carry this forward?  The message
+        # came with a DKIM2 chain that verified, the copy will be signed
+        # (split-then-sign, or the recipients are off-site already: a reply
+        # to a wrap), we hold a key for the forwarding domain, and that
+        # domain can extend the chain (-09 section 12.2).  Never a bounce:
+        # its null sender stays null, and we do not sign for <>
+        if not alias_dkim2 or self.dkim2_off or not dkim2_keydir or not env_from_addr:
+            return False
+        if self.dkim2_arrival_status != "pass":
+            return False
+        if not (dkim2_sign_daemon or self.offsite_rcpts()):
+            return False
+        try:
+            if not dkim2hop.find_key(keydir=dkim2_keydir, selector=dkim2_selector,
+                                     domain=forwarding_addr.rsplit("@", 1)[-1]):
+                return False
+            return dkim2hop.can_extend_chain(self.dkim2_seen(), forwarding_addr)
+        except Exception:
+            return False
+
     def dkim2_wants_new_from(self, hdr_from_addr, env_from_addr):
         # a list copy we are going to sign needs a From in our own domain
         # when nobody signed the post, or the list changed it since the last
         # DKIM2 signature (a footer, a subject tag, List-* fields): we answer
         # for the message then.  This is the decision mailman makes itself
         # (_dkim2_rewrites_from) unless it defers From to us, and it does not
-        # depend on DMARC or DKIM1_MUNGE_FROM.  A From already ours is left
-        # alone
+        # depend on DMARC.  A From already ours is left alone
         if self.dkim2_off or not dkim2_keydir or self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
             return False
         try:
@@ -812,10 +857,17 @@ class EnvelopeMilter(Milter.Base):
             # one recipient.  Say whether it is one of a list's many
             if exploded and not self.exploded_marks:
                 self.addheader(DKIM2_EXPLODED, "yes")
-            if not self.dkim2_off:
+            if exploded and not self.list_instance():
+                # nothing recorded either: an instance of ours would have
+                # the signing pass sign the copy after all
+                logging.info(f"{queue_id} dkim2: not signing: the list gave no Message-Instance [{self.id}]")
+            elif not self.dkim2_off:
                 self.dkim2_record(queue_id, merge=exploded)
             return
         if self.dkim2_off:
+            return
+        if exploded and not self.list_instance():
+            logging.info(f"{queue_id} dkim2: not signing: the list gave no Message-Instance [{self.id}]")
             return
         if dkim2_keydir and self.offsite_rcpts():
             if self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
@@ -823,6 +875,13 @@ class EnvelopeMilter(Milter.Base):
             elif self.dkim2_signed(queue_id, exploded, merge=exploded):
                 return
         self.dkim2_record(queue_id, merge=exploded)
+
+    def list_instance(self):
+        # list mail is only signed with DKIM2 when the list manager says what
+        # it changed: mailman with dkim2_message_instance on hands every copy
+        # back with a Message-Instance.  A copy with none (the setting off,
+        # or stock Mailman) goes out as it is, DMARC rule and all
+        return any(name.lower() == "message-instance" for name in self.dkim2_chain_fields)
 
     def dkim2_signed(self, queue_id, exploded, merge=False):
         # merge: a list's fan-out, whose changes go into mailman's instance
@@ -864,6 +923,9 @@ class EnvelopeMilter(Milter.Base):
                 if self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
                     logging.info(f"{queue_id} dkim2 sign pass: not signing, arrival was "
                                  f"{self.dkim2_arrival_status} [{self.id}]")
+                elif self.exploded_marks and not self.list_instance():
+                    logging.info(f"{queue_id} dkim2 sign pass: not signing: the list gave no "
+                                 f"Message-Instance [{self.id}]")
                 else:
                     self.dkim2_signed(queue_id, exploded=self.exploded_marks > 0)
             for idx in range(self.exploded_marks, 0, -1):
@@ -1048,9 +1110,12 @@ class EnvelopeMilter(Milter.Base):
             except KeyError:
                 rewrite_domain = forwarding_domain
             logging.info(f"rewrite domain is {rewrite_domain}")
-            if not dkim1_munge_from:
-                logging.debug(f"{queue_id} debug: DKIM1_MUNGE_FROM is off, From not rewritten for DMARC [{self.id}]")
-            if (dkim1_munge_from and check_dmarc(hdr_from_addr)) or (
+            # a list copy DKIM2 will answer for is on the DKIM2 path: the
+            # DMARC rule is not consulted, and the DKIM2 From rule decides
+            on_path = list_fanout and self.dkim2_list_path(env_from_addr, list_fanout)
+            if on_path:
+                logging.debug(f"{queue_id} debug: on the DKIM2 path, From not rewritten for DMARC [{self.id}]")
+            if (not on_path and check_dmarc(hdr_from_addr)) or (
                     list_fanout and self.dkim2_wants_new_from(hdr_from_addr, env_from_addr)):
                 new_hdr_from_addr = wrap_addr(hdr_from_addr, forwarding_domain)
                 self.change_header_from(_hdr_from_name, new_hdr_from_addr)
