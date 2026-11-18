@@ -337,13 +337,20 @@ def is_wrapped(addr):
     key = internal_addr(addr)
     return bool(wrapped_mailmatch.search(key)) and not listbounce_mailmatch.search(key)
 
-def is_wrapped_list_bounce(addr):
-    # a list's -bounces address (VERP or not) wrapped by us on the way out:
+def looks_like_wrapped_list_bounce(addr):
+    # the shape of a wrapped list bounce, whatever list it names:
     # list-bounces[+sub=domain]=40list.domain@dmarc.domain
     if not listbounce_mailmatch.search(addr):
         return False
     local, _, domain = internal_addr(addr).rpartition('@')
     return domain in rewrite_domain_reverse_map and '=40' in local
+
+def is_wrapped_list_bounce(addr):
+    # a list's -bounces address (VERP or not) wrapped by us on the way out.
+    # It is restored with addrcpt(), past Postfix's RCPT checks and with no
+    # record of the wrap, so only one of our own lists counts (as in
+    # verp_sender()); anything else would relay to <x-bounces@any.domain>
+    return looks_like_wrapped_list_bounce(addr) and check_local(unwrap_addr(addr))
 
 # a recipient that needs no quoting and reads back the same from mailman's
 # verp_regexp: no "=" in the local part, an ASCII domain
@@ -443,6 +450,11 @@ class EnvelopeMilter(Milter.Base):
             # Postfix would deliver wrap+ext@ through the wrap's row, past
             # the check below (and its expiry); nobody needs one
             logging.info(f"reject: {addr} is a wrapped address with an extension [{self.id}]")
+            self.setreply("550", "5.1.1", "unknown wrapped address")
+            return Milter.REJECT
+        if looks_like_wrapped_list_bounce(addr) and not is_wrapped_list_bounce(addr):
+            # we only wrap our own lists' bounce addresses
+            logging.info(f"reject: {addr} is not a wrapped bounce address of one of our lists [{self.id}]")
             self.setreply("550", "5.1.1", "unknown wrapped address")
             return Milter.REJECT
         if is_wrapped(addr):
