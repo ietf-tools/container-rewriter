@@ -10,6 +10,8 @@ import re
 
 import pytest
 
+import dkim2hop
+
 from test_dkim2_split import (BODY, BOUNCES, LIST, MAILMAN, SIGN, SUBSCRIBER,  # noqa: F401
                               dkim2, fields, keys, resend, send, split, verified)
 
@@ -24,10 +26,12 @@ def verp(split, monkeypatch):
 
 
 def list_copy(rewriter, mail_from=BOUNCES, rcpt=SUBSCRIBER):
-    """A list's own mail, as pass 1 hands it to the signing pass."""
+    """A list's own mail, as pass 1 hands it to the signing pass: mailman
+    gives what it originates an m=1 of its own."""
     own = fields(("From", "ietf-owner@ietf.org"), ("To", rcpt), ("Subject", "notice"),
                  ("X-DKIM2-Exploded", "yes"))
-    return send(rewriter, own, BODY, mail_from, [rcpt], daemon=SIGN)
+    m1 = dkim2hop.dkim2sign.build_message_instance([f[:-2] for f in own], BODY)
+    return send(rewriter, [m1.encode() + b"\r\n"] + own, BODY, mail_from, [rcpt], daemon=SIGN)
 
 
 def test_list_copy_gets_mailmans_verp_sender(verp):

@@ -421,7 +421,6 @@ def test_unsigned_post_through_the_list_gets_our_from(dkim2, monkeypatch):
     """Mailman's rule, mirrored: a post nobody signed that the list hands
     back with its m=1 gets a From of ours and our signature, with or
     without DMARC munging."""
-    monkeypatch.setattr(dkim2, "dkim1_munge_from", False)
     plain = fields(("X-DKIM2-Arrival", "none"), ("From", f"Alice <{AUTHOR}>"), ("To", LIST),
                    ("Subject", "hello"))
     out, body = through_mailman(plain)
@@ -448,16 +447,30 @@ def test_unsigned_post_keeps_its_from_and_goes_out_unsigned(dkim2):
     assert sent.mail_from == BOUNCES
 
 
-def test_unsigned_post_rewritten_for_dmarc_starts_a_chain(dkim2, monkeypatch):
-    """The DMARC rule gives the copy a From of ours, so we can sign it: the
-    chain starts here."""
+def test_list_copy_without_an_instance_is_munged_but_not_signed(dkim2, monkeypatch):
+    """The list recorded no Message-Instance (dkim2_message_instance off):
+    the DMARC rule still gives the copy a From of ours, but list mail is
+    only signed with DKIM2 when mailman describes what it did."""
     pins = harness.parse_pins(["example.com=reject"], "--dmarc")
     monkeypatch.setattr(dkim2, "checkdmarc", harness.LoggedCheckdmarc(harness.FakeDNS(pins, {}, True)))
     dkim2._policy_cache.clear()
     sent = send(dkim2, fields(*UNSIGNED), BODY + FOOTER, BOUNCES,
                 [SUBSCRIBER, "other@example.org"], auth=MAILMAN)
     assert sent.value("From") == f"Alice <{WRAPPED}>"
-    # one m=1, whose Recipe gives back the post as mailman handed it over
+    assert sent.named("DKIM2-Signature") == [] and sent.named("Message-Instance") == []
+
+
+def test_unsigned_mail_rewritten_for_dmarc_starts_a_chain(dkim2, monkeypatch):
+    """Not list mail: the DMARC rule gives the copy a From of ours, so we
+    can sign it, and the chain starts here."""
+    pins = harness.parse_pins(["example.com=reject"], "--dmarc")
+    monkeypatch.setattr(dkim2, "checkdmarc", harness.LoggedCheckdmarc(harness.FakeDNS(pins, {}, True)))
+    dkim2._policy_cache.clear()
+    plain = [("X-DKIM2-Arrival", "none"), ("From", f"Alice <{AUTHOR}>"), ("To", SUBSCRIBER),
+             ("Subject", "hello")]
+    sent = send(dkim2, fields(*plain), BODY, AUTHOR, [SUBSCRIBER, "other@example.org"],
+                auth="someone@ietf.org")
+    assert sent.value("From") == f"Alice <{WRAPPED}>"
     assert versions(sent) == ["1"]
     assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["1", "1"]
     # every recipient of the transaction is named together

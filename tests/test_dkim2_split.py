@@ -210,3 +210,31 @@ def test_unset_signs_inline_whatever_the_daemon_name(dkim2, keys):
     assert len(sent.named("DKIM2-Signature")) == 2
     assert sent.value("From") == f"Alice <{WRAPPED}>"
     assert sent.named("X-DKIM2-Exploded") == []
+
+
+# --- list copies the list gave no Message-Instance --------------------------------------
+
+def test_list_copy_without_an_instance_gets_no_dkim2(split, monkeypatch):
+    """dkim2_message_instance off: the DMARC rule still wraps From, the
+    first pass records nothing, and the signing pass signs nothing, but
+    still applies VERP and removes the mark."""
+    pins = harness.parse_pins(["example.com=reject"], "--dmarc")
+    monkeypatch.setattr(split, "checkdmarc", harness.LoggedCheckdmarc(harness.FakeDNS(pins, {}, True)))
+    monkeypatch.setattr(split, "list_verp", True)
+    split._policy_cache.clear()
+    post = fields(("X-DKIM2-Arrival", "none"), ("From", f"Alice <{AUTHOR}>"), ("To", LIST),
+                  ("Subject", "[ietf] hello"), ("List-Id", "<ietf.ietf.org>"))
+    first = send(split, post, BODY + FOOTER, BOUNCES, [SUBSCRIBER], auth=MAILMAN, daemon="ORIGINATING")
+    assert first.value("From") == f"Alice <{WRAPPED}>"
+    assert first.named("Message-Instance") == [] and first.named("DKIM2-Signature") == []
+    assert first.value("X-DKIM2-Exploded") == "yes"
+    copy = resend(split, first, SUBSCRIBER)
+    assert copy.named("DKIM2-Signature") == [] and copy.named("Message-Instance") == []
+    assert copy.named("X-DKIM2-Exploded") == []
+    assert "+sub=example.net" in copy.mail_from
+
+
+def test_list_copy_with_mailmans_instance_is_still_signed(split, keys):
+    first = fanout(split, keys)
+    copy = resend(split, first, SUBSCRIBER)
+    assert len(copy.named("DKIM2-Signature")) == 2

@@ -33,6 +33,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "dkim2"))
 
+import dkim2domain  # noqa: E402
 import dkim2sign  # noqa: E402
 import dkim2undo  # noqa: E402
 import dkim2verify  # noqa: E402
@@ -410,6 +411,33 @@ def _merged(seen, after):
     mine = dkim2sign.build_message_instance_from_hashes(
         _bare(after), body_hashes, version=top, recipe=merged or None)
     return versions.index(top) + 1, mine.encode("utf-8") + CRLF
+
+
+def can_extend_chain(seen, mail_from):
+    """Can a signature with this envelope sender extend the chain the
+    message came with?
+
+    -09 section 12.2 (chain of custody): the new signature's mf= has to
+    relaxed-match (section 7.2) a recipient in the rt= of the newest
+    signature already on the message.  An alias forward that keeps the
+    author's From signs with the forwarding address as its mf=, so its
+    domain has to match the alias's (or another recipient's).  False for a
+    message with no DKIM2 signature, and for one whose newest signature
+    cannot be read.
+    """
+    domain = mail_from.rsplit("@", 1)[-1].lower() if "@" in mail_from else ""
+    if not domain:
+        return False
+    signatures = [f.decode("utf-8", "surrogateescape") for f in seen.fields
+                  if _name(f) == b"dkim2-signature"]
+    if not signatures:
+        return False
+    try:
+        top = max(signatures, key=dkim2sign._get_seq_from_sig)
+        return any(dkim2domain.relaxed_match(domain, rt)
+                   for rt in dkim2verify._rt_domains(top.split(":", 1)[1]))
+    except Exception:
+        return False
 
 
 def _has_chain(header_fields):

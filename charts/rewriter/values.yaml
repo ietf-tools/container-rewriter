@@ -18,9 +18,10 @@ rewriter:
     - myaddr.com
   rewriteDomains:
     lists.myaddr.com: dmarc.myaddr.com
-  # rewrite From for a sender whose domain publishes DMARC p=reject or
-  # p=quarantine (the DKIM1 "munge"); false relies on DKIM2 alone
-  dkim1MungeFrom: true
+  # let alias forwards of DKIM2-signed mail keep their From and extend the
+  # sender's chain, instead of the DMARC rule's From (needs dkim2.keys and
+  # dkim2.signDaemon; see ALIAS_DKIM2 in DKIM2.md)
+  aliasDkim2: false
   # DKIM2 (see DKIM2.md); everything here is off by default
   dkim2:
     # authserv-id for Authentication-Results; set it to turn on verification
