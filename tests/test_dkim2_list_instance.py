@@ -12,10 +12,9 @@ import base64
 
 import dkim2hop
 import harness
-from test_dkim2_milter import (AUTHOR, BODY, BOUNCES, LIST, MAILMAN, SUBSCRIBER,  # noqa: F401
-                               WRAPPED, author_post, dkim2, fields, keys, send,
-                               through_mailman, verified, versions)
-from test_dkim2_split import SIGN, resend, split  # noqa: F401
+from test_dkim2_milter import (AUTHOR, BODY, BOUNCES, LIST, MAILMAN, SUBSCRIBER, WRAPPED,  # noqa: F401
+                               author_post, fields, send, through_mailman, verified, versions)
+from test_dkim2_split import SIGN, resend  # noqa: F401
 from test_dkim2_split import send as send_split
 
 

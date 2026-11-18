@@ -11,18 +11,12 @@ import pytest
 
 import dkim2hop
 import harness
-from test_dkim2_milter import (AUTHOR, BODY, BOUNCES, FOOTER, LIST, MAILMAN,  # noqa: F401
-                               SUBSCRIBER, T, UNSIGNED, WRAPPED, Ctx, Sent, author_post,
-                               dkim2, fields, keys, through_mailman, verified, versions)
+from test_dkim2_milter import (AUTHOR, BODY, BOUNCES, FOOTER, LIST, MAILMAN, SUBSCRIBER, T,  # noqa: F401
+                               UNSIGNED, WRAPPED, Ctx, Sent, author_post, fields,
+                               through_mailman, verified, versions)
 
-SIGN = "DKIM2-SIGN"
+from conftest import SIGN  # noqa: F401  (the signing pass's daemon name)
 OTHER = "other@example.org"
-
-
-@pytest.fixture
-def split(dkim2, monkeypatch):
-    monkeypatch.setattr(dkim2, "dkim2_sign_daemon", SIGN)
-    return dkim2
 
 
 def send(rewriter, header_fields, body, mail_from, rcpts, auth=None, daemon=None):

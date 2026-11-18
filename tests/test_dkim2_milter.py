@@ -5,13 +5,11 @@ import email.utils
 import os
 
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519
 
 import dkim2hop
 import harness
 
-T = 1740000000
+from conftest import T  # noqa: F401  (the tests' clock, shared)
 LIST = "ietf@ietf.org"
 BOUNCES = "ietf-bounces@ietf.org"
 MAILMAN = "mailman@ietf.org"
@@ -25,40 +23,6 @@ FOOTER = b"-- \r\nietf mailing list\r\n"
 class Ctx(harness.FakeCtx):
     def addheader(self, field, value, idx=-1):
         self.actions.append(("addheader", field, value, idx))
-
-
-@pytest.fixture(scope="module")
-def keys(tmp_path_factory):
-    keydir = tmp_path_factory.mktemp("keys")
-    dns = {}
-    for domain in ("example.com", "ietf.org"):
-        key = ed25519.Ed25519PrivateKey.generate()
-        os.makedirs(keydir / domain)
-        (keydir / domain / "sel1.key").write_bytes(key.private_bytes(
-            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption()))
-        public = base64.b64encode(key.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
-        dns[domain] = {"sel1._domainkey": [["txt", f"v=DKIM1; k=ed25519; p={public}"]]}
-    return str(keydir), dns
-
-
-@pytest.fixture
-def dkim2(rewriter, keys, monkeypatch):
-    """The rewriter with DKIM2 configured, no DMARC or SPF policy anywhere,
-    and a clock near the test messages' timestamps."""
-    import time
-    keydir, dns = keys
-    monkeypatch.setattr(time, "time", lambda: T + 60)
-    monkeypatch.setattr(rewriter, "dkim2_keydir", keydir)
-    monkeypatch.setattr(rewriter, "dkim2_selector", "sel1")
-    monkeypatch.setattr(rewriter, "dkim2_authserv_id", "mail.ietf.org")
-    monkeypatch.setattr(rewriter, "dkim2_dns", dns)
-    monkeypatch.setattr(rewriter, "checkdmarc",
-                        harness.LoggedCheckdmarc(harness.FakeDNS({}, {}, True)))
-    monkeypatch.setattr(rewriter, "get_db_pool", lambda: harness.FakeDB(virtual=(), down=False))
-    rewriter._policy_cache.clear()
-    return rewriter
 
 
 class Sent:

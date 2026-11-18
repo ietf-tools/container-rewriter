@@ -14,10 +14,10 @@ import pytest
 
 import harness
 
-from test_dkim2_milter import (AUTHOR, BODY, BOUNCES, LIST, MAILMAN, SUBSCRIBER,  # noqa: F401
-                               UNWRAPPED, WRAP, author_post, dkim2, fields, keys,
-                               through_mailman, to_list_and_wrap, versions)
-from test_dkim2_split import SIGN, OTHER, send, split  # noqa: F401
+from test_dkim2_milter import (AUTHOR, BODY, BOUNCES, LIST, MAILMAN, SUBSCRIBER, UNWRAPPED,  # noqa: F401
+                               WRAP, author_post, fields, through_mailman, to_list_and_wrap,
+                               versions)
+from test_dkim2_split import SIGN, OTHER, send  # noqa: F401
 
 
 @pytest.fixture

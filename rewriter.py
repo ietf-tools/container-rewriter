@@ -21,9 +21,11 @@ forwarding_domain = os.environ.get("FORWARDING_DOMAIN", "myaddr.com")
 local_domains = os.environ.get("LOCAL_DOMAINS", forwarding_domain)
 rewrite_domains = os.environ.get("REWRITE_DOMAINS", "map[mydomain.com:dmarc.mydomain.com]")
 
+
 def parse_ignore_list(value):
     # comma separated; entries are trimmed and matched case-insensitively
     return {x.strip().lower() for x in value.split(',') if x.strip()}
+
 
 ignore_list = parse_ignore_list(os.environ.get("IGNORELIST", "alldanes@lists.sys.slush.ca"))
 # Postfix's recipient_delimiter: user+ext@domain is looked up as itself,
@@ -83,7 +85,7 @@ rewrite_domain_map = {
     x.split(":")[0]: x.split(":")[1] for x in rewrite_domains[4:-1].split(" ")
 }
 
-rewrite_domain_reverse_map = dict(map(reversed,rewrite_domain_map.items()))
+rewrite_domain_reverse_map = dict(map(reversed, rewrite_domain_map.items()))
 
 milter_listening_port = os.environ.get("LISTENING_PORT", "8800")
 http_listening_port = os.environ.get("HTTP_LISTENING_PORT", "8000")
@@ -129,6 +131,7 @@ file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
 logging = logging.LoggerAdapter(logger)
 
+
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         if self.path != "/healthz":
@@ -172,6 +175,8 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
 
 _db_pool = None
 _db_pool_lock = threading.Lock()
+
+
 def get_db_pool() -> ConnectionPool:
     # each milter connection runs in its own thread; without the lock two
     # first messages could each build a pool, and one would leak
@@ -203,9 +208,11 @@ def lookup_keys(key):
             return [key, f"{local[:i]}{at}{domain}"]
     return [key]
 
+
 def is_ignored(key):
     # an ignore list entry also covers its +extension addresses
     return any(k in ignore_list for k in lookup_keys(key))
+
 
 def test_virtual_alias(email_addr):
     # alias+ext@domain is expanded through alias@domain, as Postfix does
@@ -214,6 +221,7 @@ def test_virtual_alias(email_addr):
         cur.execute("SELECT email from virtual where email = ANY(%s)", [keys])
         return len(cur.fetchall()) > 0
 
+
 def _dns_temporary_failure(status):
     # a timeout ("... timed out", or "The resolution lifetime expired ..."
     # when the overall lifetime runs out) or a SERVFAIL ("All nameservers
@@ -221,6 +229,7 @@ def _dns_temporary_failure(status):
     # nothing about the domain's policy, so it must not be cached
     error = (status.get("error") or "").lower()
     return any(s in error for s in ("timed out", "lifetime expired", "servfail"))
+
 
 def _check_dmarc_uncached(domain):
     matches = ["reject", "quarantine"]
@@ -236,6 +245,7 @@ def _check_dmarc_uncached(domain):
         return None
     return False
 
+
 def _check_spf_uncached(domain):
     matches = ["softfail", "fail"]
     spf_status = checkdmarc.check_spf(domain, timeout=1.0, timeout_retries=2)
@@ -245,6 +255,7 @@ def _check_spf_uncached(domain):
     if _dns_temporary_failure(spf_status):
         return None
     return False
+
 
 def _cached(kind, fn, email_addr):
     domain = email_addr.rsplit("@")[-1].lower()
@@ -256,11 +267,14 @@ def _cached(kind, fn, email_addr):
             _policy_cache[key] = result
     return bool(result)
 
+
 def check_dmarc(email_addr):
     return _cached("dmarc", _check_dmarc_uncached, email_addr)
 
+
 def check_spf(email_addr):
     return _cached("spf", _check_spf_uncached, email_addr)
+
 
 def format_from_header(name, addr):
     # parseaddr() hands back the raw display name: it may be RFC 2047
@@ -287,12 +301,15 @@ def format_from_header(name, addr):
     encoded = Header(display, "utf-8", maxlinelen=75).encode(linesep="\n")
     return " ".join(encoded.split()) + f" <{addr}>"
 
+
 _atom = re.compile(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~\x80-\U0010ffff-]+")
+
 
 def unquote_local(local):
     if len(local) >= 2 and local[0] == local[-1] == '"':
         return re.sub(r'\\(.)', r'\1', local[1:-1])
     return local
+
 
 def quote_local(local):
     # RFC 5321/5322: a local part that is not a dot-atom must be quoted
@@ -300,19 +317,23 @@ def quote_local(local):
         return local
     return '"' + local.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
+
 def internal_addr(addr):
     # Postfix's internal (unquoted) form, as used for virtual table lookups
     local, _, domain = addr.rpartition('@')
     return f"{unquote_local(local)}@{domain}".lower()
 
+
 def wrap_addr(addr, new_domain):
     local, _, domain = addr.rpartition('@')
     return f"{quote_local(unquote_local(local) + '=40' + domain.lower())}@{new_domain}"
+
 
 def unwrap_addr(addr):
     local, _, _ = addr.rpartition('@')
     user, sep, orig_domain = unquote_local(local).rpartition('=40')
     return f"{quote_local(user)}@{orig_domain}" if sep else addr
+
 
 def unwrap_header_addrs(value, wrapped=None):
     # an address-list header (To:, Cc:) with our wrapped addresses unwrapped,
@@ -333,6 +354,7 @@ def unwrap_header_addrs(value, wrapped=None):
             lines[-1] += ", " + addr
     return ",\n\t".join(lines)
 
+
 def valid_wraps(addrs):
     # the wrapped addresses we handed out in the last 30 days.  Recipients
     # added with addrcpt() skip Postfix's RCPT checks, so only these may be
@@ -346,10 +368,12 @@ def valid_wraps(addrs):
                     """, ([internal_addr(a) for a in addrs],))
         return {row[0] for row in cur.fetchall()}
 
+
 def is_wrapped(addr):
     # list bounces are wrapped too, but unwrap_list_bounces() handles those
     key = internal_addr(addr)
     return bool(wrapped_mailmatch.search(key)) and not listbounce_mailmatch.search(key)
+
 
 def looks_like_wrapped_list_bounce(addr):
     # the shape of a wrapped list bounce, whatever list it names:
@@ -359,6 +383,7 @@ def looks_like_wrapped_list_bounce(addr):
     local, _, domain = internal_addr(addr).rpartition('@')
     return domain in rewrite_domain_reverse_map and '=40' in local
 
+
 def is_wrapped_list_bounce(addr):
     # a list's -bounces address (VERP or not) wrapped by us on the way out.
     # It is restored with addrcpt(), past Postfix's RCPT checks and with no
@@ -366,10 +391,12 @@ def is_wrapped_list_bounce(addr):
     # verp_sender()); anything else would relay to <x-bounces@any.domain>
     return looks_like_wrapped_list_bounce(addr) and check_local(unwrap_addr(addr))
 
+
 # a recipient that needs no quoting and reads back the same from mailman's
 # verp_regexp: no "=" in the local part, an ASCII domain
 _verp_local = re.compile(r"[A-Za-z0-9!#$%&'*+/?^_`{|}~.-]+")
 _verp_domain = re.compile(r"[A-Za-z0-9.-]+")
+
 
 def verp_sender(env_from, rcpt):
     # mailman's verp_format, ${bounces}+${local}=${domain}, for a list's
@@ -394,10 +421,12 @@ def verp_sender(env_from, rcpt):
         return wrap_addr(f"{bounces}+{rlocal}={rdomain}@{list_domain}", domain)
     return f"{bounces}+{rlocal}={rdomain}@{domain}"
 
+
 def check_local(email_addr):
     local_domain_list = local_domains.split(" ")
     domain = email_addr.rsplit("@")[-1].lower()
     return domain in local_domain_list
+
 
 def update_addr_wrap_log(email_addr, new_email_addr):
     update_addr_wrap_log = """
@@ -412,6 +441,7 @@ def update_addr_wrap_log(email_addr, new_email_addr):
     except psycopg.OperationalError as e:
         logging.info(f"failed to update addr_wrap_log: {e}")
     return True
+
 
 class EnvelopeMilter(Milter.Base):
     def __init__(self):
@@ -677,6 +707,7 @@ class EnvelopeMilter(Milter.Base):
         if self.addr_headers_unwrapped:
             return
         self.addr_headers_unwrapped = True
+
         def ours(addr):
             return is_wrapped(addr) or is_wrapped_list_bounce(addr)
         # chgheader() counts from 1 among headers of the same name
@@ -709,18 +740,21 @@ class EnvelopeMilter(Milter.Base):
             new_env_from = self.change_env_from(env_from_addr, forwarding_addr, queue_id)
             self.change_header_from(hdr_from_name, new_hdr_from_addr)
             logging.info(
-                f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr or '<>'} to {new_env_from or '<>'}, header-from changed {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
+                f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr or '<>'} to "
+                f"{new_env_from or '<>'}, header-from changed {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
             )
         # SPF is checked on the MAIL FROM domain; we already send for
         # our local domains, so forwarding can't break theirs
         elif env_from_addr and not check_local(env_from_addr) and check_spf(env_from_addr):
             logging.info(
-                f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: {env_from_addr or '<>'} [{self.id}]"
+                f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: "
+                f"{env_from_addr or '<>'} [{self.id}]"
             )
             self.change_env_from(env_from_addr, forwarding_addr, queue_id)
         else:
             logging.info(
-                f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} [{self.id}]"
+                f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} "
+                f"[{self.id}]"
             )
 
     def dkim2_seen(self):
@@ -1015,7 +1049,7 @@ class EnvelopeMilter(Milter.Base):
     def eom(self):
         queue_id = None
         try:
-            queue_id = self.getsymval('i') # queue id
+            queue_id = self.getsymval('i')  # queue id
             if self.dkim2_signing:
                 return self.dkim2_sign_copy(queue_id)
             self.dkim2_arrival_status = self.dkim2_arrival(self.dkim2_verify_arrival(queue_id))
@@ -1098,7 +1132,8 @@ class EnvelopeMilter(Milter.Base):
         # original From, so it doesn't count
         elif test_virtual_alias([k for k in self.rcpt_keys() if not is_ignored(k)]):
             logging.debug(
-                f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
+                f"{queue_id} debug: Virtual address recipient, check if rewrite needed Envelope-To: {self.mail_to} "
+                f"Header-To: {hdr_to_addr} [{self.id}]"
             )
             self.rewrite_forwarded(_hdr_from_name, hdr_from_addr, env_from_addr, queue_id)
             return Milter.ACCEPT
@@ -1108,13 +1143,15 @@ class EnvelopeMilter(Milter.Base):
         # needs the rewrite below
         elif not self.offsite_rcpts():
             logging.info(
-                f"{queue_id} none: no off-site recipients, no action needed Envelope-To: {self.mail_to} Header-To: {hdr_to_addr} [{self.id}]"
+                f"{queue_id} none: no off-site recipients, no action needed Envelope-To: {self.mail_to} Header-To: "
+                f"{hdr_to_addr} [{self.id}]"
             )
             return Milter.ACCEPT
         # scenario 3
         if check_local(env_from_addr) and check_local(hdr_from_addr):
             logging.info(
-                f"{queue_id} none: List source, no action needed Envelope-From: {env_from_addr} Header-From: {hdr_from_addr} [{self.id}]"
+                f"{queue_id} none: List source, no action needed Envelope-From: {env_from_addr} Header-From: "
+                f"{hdr_from_addr} [{self.id}]"
             )
             return Milter.ACCEPT
         # no scenario match
@@ -1144,16 +1181,20 @@ class EnvelopeMilter(Milter.Base):
                 if internal_addr(new_env_from) != internal_addr(new_hdr_from_addr):
                     self.log_envelope_wrap(env_from_addr, new_env_from)
                 logging.info(
-                    f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr or '<>'} to {new_env_from or '<>'} header-From changed from {hdr_from_addr} to {new_hdr_from_addr} [{self.id}]"
+                    f"{queue_id} rewrite-both: Envelope-From changed from {env_from_addr or '<>'} to "
+                    f"{new_env_from or '<>'} header-From changed from {hdr_from_addr} to {new_hdr_from_addr} "
+                    f"[{self.id}]"
                 )
             # SPF is checked on the MAIL FROM domain; we already send for
             # our local domains, so forwarding can't break theirs
             elif env_from_addr and not check_local(env_from_addr) and check_spf(env_from_addr):
                 logging.info(
-                    f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: {env_from_addr or '<>'} [{self.id}]"
+                    f"{queue_id} rewrite-envelope: SPF only, Header-From: {hdr_from_addr} Envelope-From: "
+                    f"{env_from_addr or '<>'} [{self.id}]"
                 )
                 try:
-                    new_env_from = self.change_env_from(env_from_addr, wrap_addr(env_from_addr, rewrite_domain), queue_id)
+                    new_env_from = self.change_env_from(
+                        env_from_addr, wrap_addr(env_from_addr, rewrite_domain), queue_id)
                 except Exception as e:
                     logging.info(f"{queue_id} error: chgfrom failed: {e} [{self.id}]")
                 else:
@@ -1161,7 +1202,8 @@ class EnvelopeMilter(Milter.Base):
                 return Milter.ACCEPT
             else:
                 logging.info(
-                    f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} [{self.id}]"
+                    f"{queue_id} none: No change for Envelope-From {env_from_addr} or Header-From {hdr_from_addr} "
+                    f"[{self.id}]"
                 )
             return Milter.ACCEPT
 
@@ -1207,4 +1249,3 @@ if __name__ == "__main__":
     logging.info(f"info: logging rotation period is {logging_rotate_period}")
 
     main()
-
