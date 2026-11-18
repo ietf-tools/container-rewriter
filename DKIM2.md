@@ -61,7 +61,9 @@ case the change is recorded:
 - a message that has `Message-Instance` fields gets the next one, with the
   Recipe that undoes the change;
 - a message with none gets `m=1` for the message as it was handed over and
-  `m=2` with the Recipe.
+  `m=2` with the Recipe;
+- a list's fan-out (below) gets no instance of its own: the change goes
+  into mailman's.
 
 When the rewriter signs, its signature covers them. When it does not, they
 stay on the message unsigned. The copy delivered to mailman then has a
@@ -134,10 +136,23 @@ mailman hands the copies back over an authenticated connection. So when
 the arrival verdict was `pass` or `none`, the `Message-Instance` fields
 nobody has signed yet are ours to answer for, whichever of our components
 wrote them: the rewriter on arrival (above), or mailman. The rewriter keeps
-them, adds its own as the next one, and
-signs once over all of them. That holds when the signature is the first on
-the message too: a post nobody signed, which mailman gave an `m=1`, leaves
-with mailman's `m=1`, the rewriter's `m=2` and `i=1; m=2`.
+them and signs once over all of them.
+
+On a list's fan-out (mailman's SASL user, a `-bounces` envelope sender),
+mailman's top instance and the rewriter's changes to the same copy are one
+step by one organisation, so they share one instance. The rewriter rewrites
+mailman's unsigned top `Message-Instance` in place: it keeps its `m=`, gets
+the hashes of the copy as it leaves, and gets a single header Recipe back to
+the message as the list received it (mailman's Recipe applied first, then
+the difference worked out again). The body Recipe stays mailman's, since the
+rewriter does not change the body. A post signed by its author and given
+`m=2` by the list leaves with `m=2` and `i=2; m=2`; a post nobody signed,
+which mailman gave an `m=1`, leaves with that `m=1` and `i=1; m=1`. In
+split-then-sign mode the first pass rewrites the instance, and the signing
+pass signs it. The rewriter adds an instance of its own as before when the
+mail is not a fan-out, when a signature already covers the top instance, or
+when that instance cannot be taken apart (a null header Recipe, a body hash
+algorithm the rewriter did not compute).
 
 The body may have changed since the last signature; that is what the
 instances are for. If mailman could not describe the change (it records a

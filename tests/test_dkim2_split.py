@@ -69,9 +69,10 @@ def test_normal_mode_rewrites_and_records_but_never_signs(split, keys):
     assert sent.result == split.Milter.ACCEPT
     assert sent.value("From") == f"Alice <{WRAPPED}>"
     assert sent.mail_from != BOUNCES
-    # example.com's signature only; ours is left to pass 2
+    # example.com's signature only; ours is left to pass 2.  The From
+    # change is recorded in mailman's m=2
     assert len(sent.named("DKIM2-Signature")) == 1
-    assert versions(sent) == ["3", "2", "1"]
+    assert versions(sent) == ["2", "1"]
 
 
 def test_normal_mode_marks_a_list_fanout_as_exploded(split, keys):
@@ -110,7 +111,7 @@ def test_sign_mode_signs_each_copy_for_its_one_recipient(split, keys):
         copy = resend(split, first, rcpt)
         assert copy.result == split.Milter.ACCEPT
         assert rt(copy) == [f"<{rcpt}>"]
-        assert [copy.tag("DKIM2-Signature", "i"), copy.tag("DKIM2-Signature", "m")] == ["2", "3"]
+        assert [copy.tag("DKIM2-Signature", "i"), copy.tag("DKIM2-Signature", "m")] == ["2", "2"]
         assert copy.tag("DKIM2-Signature", "f") == "exploded"
         assert copy.tag("DKIM2-Signature", "d") == "ietf.org"
         result = verified(split, copy)

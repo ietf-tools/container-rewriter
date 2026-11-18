@@ -797,35 +797,40 @@ class EnvelopeMilter(Milter.Base):
             if exploded and not self.exploded_marks:
                 self.addheader(DKIM2_EXPLODED, "yes")
             if not self.dkim2_off:
-                self.dkim2_record(queue_id)
+                self.dkim2_record(queue_id, merge=exploded)
             return
         if self.dkim2_off:
             return
         if dkim2_keydir and self.offsite_rcpts():
             if self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
                 logging.info(f"{queue_id} dkim2: not signing, arrival was {self.dkim2_arrival_status} [{self.id}]")
-            elif self.dkim2_signed(queue_id, exploded):
+            elif self.dkim2_signed(queue_id, exploded, merge=exploded):
                 return
-        self.dkim2_record(queue_id)
+        self.dkim2_record(queue_id, merge=exploded)
 
-    def dkim2_signed(self, queue_id, exploded):
+    def dkim2_signed(self, queue_id, exploded, merge=False):
+        # merge: a list's fan-out, whose changes go into mailman's instance
         mail_from = self.env_from_out or email.utils.parseaddr(self.mail_from)[1]
         try:
             signed = dkim2hop.sign(self.dkim2_seen(), self.fields_after_changes(),
                                    mail_from, self.mail_to, dkim2_keydir,
-                                   exploded=exploded, selector=dkim2_selector)
+                                   exploded=exploded, selector=dkim2_selector, merge=merge)
         except Exception:
             self.dkim2_give_up("signing")
             return True
         if not signed:
             logging.info(f"{queue_id} dkim2: not signing: {signed.reason} [{self.id}]")
             return False
+        for name, idx, value in signed.change:
+            self.change_header(name, idx, value)
         # each goes in at the top, so the last one in is the first field
         for name, value in reversed(signed.insert):
             self.addheader(name, value, 0)
+        if signed.change:
+            logging.debug(f"{queue_id} dkim2: our header changes went into the list's Message-Instance [{self.id}]")
         logging.info(
             f"{queue_id} dkim2: signed d={signed.domain} for {mail_from} "
-            f"({', '.join(n for n, _v in signed.insert)}) [{self.id}]")
+            f"({', '.join([n for n, _v in signed.insert] + [n for n, _i, _v in signed.change])}) [{self.id}]")
         return True
 
     def dkim2_sign_copy(self, queue_id):
@@ -880,7 +885,7 @@ class EnvelopeMilter(Milter.Base):
         if removed:
             logging.info(f"{queue_id} dkim2: no signing keys, removed {removed} DKIM2 header fields [{self.id}]")
 
-    def dkim2_record(self, queue_id):
+    def dkim2_record(self, queue_id, merge=False):
         # we are not signing, but we may have changed header fields DKIM2
         # hashes (To and Cc unwrapped; From, for an alias).  Always say so,
         # in Message-Instance fields nobody has signed: the copy that goes
@@ -892,12 +897,20 @@ class EnvelopeMilter(Milter.Base):
         if not self.header_changes:
             return
         try:
-            recorded = dkim2hop.record(self.dkim2_seen(), self.fields_after_changes())
+            recorded = dkim2hop.record(self.dkim2_seen(), self.fields_after_changes(), merge=merge)
         except Exception:
             self.dkim2_give_up("recording changes")
             return
         if not recorded:
             logging.debug(f"{queue_id} dkim2: no instance added: {recorded.reason} [{self.id}]")
+            return
+        if recorded.change:
+            # a list's fan-out: mailman's instance now says what we changed too
+            for name, idx, value in recorded.change:
+                self.change_header(name, idx, value)
+            # (the same words as below: the log pipeline parses them)
+            logging.debug(f"{queue_id} dkim2: our header changes went into the list's Message-Instance [{self.id}]")
+            logging.info(f"{queue_id} dkim2: recorded our header changes in an unsigned Message-Instance [{self.id}]")
             return
         for name, value in reversed(recorded.insert):
             self.addheader(name, value, 0)
