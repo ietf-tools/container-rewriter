@@ -159,11 +159,13 @@ def test_sign_mode_without_the_mark_is_not_exploded(split, keys, monkeypatch):
 
 @pytest.mark.parametrize("status", ["fail", "permerror", "temperror"])
 def test_sign_mode_does_not_sign_over_a_failed_arrival(split, keys, status):
+    """Not signed, so not sent on with a chain that will not verify either
+    (-09 section 13.1): the whole chain is removed."""
     arrived = fields(("X-DKIM2-Arrival", status)) + author_post(keys)
     out, body = through_mailman(arrived)
     copy = send(split, out, body, BOUNCES, [SUBSCRIBER], daemon=SIGN)
     assert copy.result == split.Milter.ACCEPT
-    assert len(copy.named("DKIM2-Signature")) == 1
+    assert no_chain(copy)
 
 
 def test_sign_mode_never_rewrites_or_touches_the_database(split, monkeypatch):
@@ -198,7 +200,7 @@ def test_an_error_in_sign_mode_sends_the_copy_unsigned(split, keys, monkeypatch)
     monkeypatch.setattr(dkim2hop, "sign", boom)
     copy = resend(split, first, SUBSCRIBER)
     assert copy.result == split.Milter.ACCEPT
-    assert len(copy.named("DKIM2-Signature")) == 1
+    assert no_chain(copy)
 
 
 # --- unset: today's behaviour ---------------------------------------------------------
@@ -238,3 +240,62 @@ def test_list_copy_with_mailmans_instance_is_still_signed(split, keys):
     first = fanout(split, keys)
     copy = resend(split, first, SUBSCRIBER)
     assert len(copy.named("DKIM2-Signature")) == 2
+
+
+# --- the signing pass sends nothing on with a chain it did not sign ---------------------
+# An off-site copy the signing pass does not sign would carry a chain that no
+# longer verifies (a list that changed it without saying so, our own unsigned
+# instances, a failed arrival).  -09 section 13.1: discard every DKIM2 field
+# instead, so it leaves with none.
+
+def no_chain(sent):
+    return sent.named("DKIM2-Signature") == [] and sent.named("Message-Instance") == []
+
+
+def test_stock_mailman_copy_of_a_signed_post_leaves_with_no_chain(split, keys):
+    """The author signed with DKIM2; a list with no Message-Instance changed
+    the post: the signer refuses, and the broken chain is removed."""
+    arrived = fields(("X-DKIM2-Arrival", "pass")) + author_post(keys)
+    out, body = through_mailman(arrived, instance=False)
+    out = fields(("X-DKIM2-Exploded", "yes")) + out
+    copy = send(split, out, body, BOUNCES, [SUBSCRIBER], daemon=SIGN)
+    assert copy.result == split.Milter.ACCEPT
+    assert no_chain(copy)
+    assert copy.named("X-DKIM2-Exploded") == []
+
+
+def test_our_arrival_instance_through_stock_mailman_is_removed(split, keys, monkeypatch):
+    """The rewriter recorded an unwrapped To on the way to the list; stock
+    mailman changed the post without an instance of its own.  The fan-out
+    copy cannot be signed, so the chain, ours included, is removed."""
+    from test_dkim2_milter import WRAP, to_list_and_wrap
+    monkeypatch.setattr(split, "get_db_pool", lambda: harness.FakeDB(virtual=[WRAP], down=False))
+    first = send(split, to_list_and_wrap(keys), BODY, AUTHOR, [LIST, WRAP], daemon="mx.ietf.org")
+    assert len(first.named("Message-Instance")) == 2
+    out, body = through_mailman(first.fields, instance=False)
+    fan = send(split, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN, daemon="ORIGINATING")
+    copy = resend(split, fan, SUBSCRIBER)
+    assert no_chain(copy)
+
+
+def test_no_key_for_the_sender_leaves_with_no_chain(split, keys, monkeypatch, tmp_path):
+    monkeypatch.setattr(split, "dkim2_keydir", str(tmp_path))      # keys for nobody
+    first = fanout(split, keys)
+    copy = resend(split, first, SUBSCRIBER)
+    assert no_chain(copy)
+
+
+def test_a_signed_copy_keeps_its_chain(split, keys):
+    copy = resend(split, fanout(split, keys), SUBSCRIBER)
+    assert len(copy.named("DKIM2-Signature")) == 2
+    assert verified(split, copy).status == "pass"
+
+
+def test_the_removal_is_logged_with_its_reason(split, keys, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="rewriter")
+    arrived = fields(("X-DKIM2-Arrival", "fail")) + author_post(keys)
+    out, body = through_mailman(arrived)
+    send(split, out, body, BOUNCES, [SUBSCRIBER], daemon=SIGN)
+    # the author's signature and m=1, and mailman's m=2
+    assert "dkim2 sign pass: not signed, removed 3 DKIM2 header fields" in caplog.text
