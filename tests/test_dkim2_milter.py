@@ -293,15 +293,15 @@ def versions(sent):
 
 
 def test_unwrapped_to_on_an_unsigned_post_is_recorded_too(dkim2, keys, our_key_only):
-    """No chain yet, and we still say what we did: m=1 is the post as it
-    arrived, m=2 has the Recipe back to it.  Nobody has signed, so this
-    means nothing outside; the list fan-out signs over both."""
+    """No chain yet, and we still say what we did: one m=1, with the
+    Recipe back to the post as it arrived.  Nobody has signed, so this
+    means nothing outside; the list fan-out signs over it."""
     sent = send(dkim2, to_list_and_wrap(keys, signed=False), BODY, AUTHOR, [LIST, WRAP])
     assert sent.value("To") == f"{LIST}, {UNWRAPPED}"
     assert sent.named("DKIM2-Signature") == []
-    assert versions(sent) == ["2", "1"]
+    assert versions(sent) == ["1"]
     assert dkim2hop.stream(sent.fields, BODY, dns=dkim2.dkim2_dns, arriving=False).result().status == "pass"
-    # undoing m=2 gives the To that arrived
+    # undoing m=1 gives the To that arrived
     recipe = base64.b64decode(sent.tag("Message-Instance", "r")).decode()
     assert WRAP in recipe
 
@@ -432,9 +432,9 @@ def test_unsigned_post_rewritten_for_dmarc_starts_a_chain(dkim2, monkeypatch):
     sent = send(dkim2, fields(*UNSIGNED), BODY + FOOTER, BOUNCES,
                 [SUBSCRIBER, "other@example.org"], auth=MAILMAN)
     assert sent.value("From") == f"Alice <{WRAPPED}>"
-    # m=1 is the post as mailman handed it over, m=2 our change of From
-    assert versions(sent) == ["2", "1"]
-    assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["1", "2"]
+    # one m=1, whose Recipe gives back the post as mailman handed it over
+    assert versions(sent) == ["1"]
+    assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["1", "1"]
     # every recipient of the transaction is named together
     rt = [base64.b64decode(x).decode() for x in sent.tag("DKIM2-Signature", "rt").split(",")]
     assert rt == [f"<{SUBSCRIBER}>", "<other@example.org>"]
