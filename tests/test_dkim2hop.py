@@ -373,9 +373,25 @@ def test_stream_in_pieces_is_the_whole(keys):
         seen.feed(BODY[i:i + 3])
     assert seen.result().status == "pass"
     assert seen.body_hash() == dkim2hop.dkim2sign.compute_body_hash(BODY)
-    assert not seen.body_changed_since_signature()
+    assert not seen.changed_since_signature()
     more = dkim2hop.stream(arrived, BODY + b"footer\r\n", dns=dns, arriving=False)
-    assert more.body_changed_since_signature()
+    assert more.changed_since_signature()
+
+
+def test_changed_since_signature(keys):
+    """Mailman's rule (_dkim2_rewrites_from): a post nobody signed, or one
+    whose hashed header fields or body changed since the newest signature."""
+    _keydir, dns = keys
+    arrived = post(keys)
+    same = dkim2hop.stream(arrived, BODY, dns=dns, arriving=False)
+    assert not same.changed_since_signature()
+    footer = dkim2hop.stream(arrived, BODY + b"footer\r\n", dns=dns, arriving=False)
+    assert footer.changed_since_signature()
+    tagged = [dkim2hop.header_field("Subject", "[ietf] hello") if dkim2hop._name(f) == b"subject" else f
+              for f in arrived]
+    assert dkim2hop.stream(tagged, BODY, dns=dns, arriving=False).changed_since_signature()
+    plain = fields(("From", "a@example.com"), ("To", LIST))
+    assert dkim2hop.stream(plain, BODY, dns=dns, arriving=False).changed_since_signature()
 
 
 def test_unhashed_body_is_not_signed(keys):
@@ -384,6 +400,6 @@ def test_unhashed_body_is_not_signed(keys):
     seen = dkim2hop.stream(plain, BODY, dns=dns, arriving=False, may_sign=False)
     assert not seen.hashed and seen.body_hash() is None
     assert seen.result().status == "none"
-    assert not seen.body_changed_since_signature()
+    assert seen.changed_since_signature()
     signed = dkim2hop.sign(seen, plain, "chair@ietf.org", ["bob@example.net"], keydir, timestamp=T)
     assert not signed and signed.reason == "the body was not hashed"
