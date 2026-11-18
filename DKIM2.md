@@ -125,7 +125,8 @@ goes out without our signature, as today. If the DMARC rule rewrites it, it
 is signed, and the chain starts with us.
 
 The rule applies to mailman fan-out only. Alias forwarding keeps its existing
-rules.
+rules. With `DKIM1_MUNGE_FROM=no` this rule is the only one that rewrites
+From.
 
 The From is only taken over when the copy will be signed: if the chain
 mailman hands back does not verify (stock Mailman, below), From and the
@@ -193,6 +194,7 @@ unknown `X-` fields through.
 | `DKIM2_KEYDIR` | Turns on signing. A directory with one sub-directory per signing domain. |
 | `DKIM2_SELECTOR` | The selector to sign with: the key is `<DKIM2_KEYDIR>/<signing domain>/<DKIM2_SELECTOR>.key`. If unset, the newest `.key` file in the domain's directory is used, and its name is the selector. See below. |
 | `DKIM2_SIGN_DAEMON` | Split then sign. Mail is signed only on connections whose `{daemon_name}` macro equals this; everything else is rewritten and recorded, never signed. Unset, mail is signed in the transaction that relays it off-site. See below. |
+| `DKIM1_MUNGE_FROM` | On by default: From is rewritten for a sender whose domain publishes DMARC `p=reject` or `p=quarantine`. `no` turns that off, so From is rewritten only by the From rule below, on a list fan-out. Mail DKIM2 does not cover (alias forwards, unsigned posts, posts from domains without DKIM2) then keeps the author's From, and may fail DMARC at receivers that do not understand DKIM2. Helm: `rewriter.dkim1MungeFrom: false`. |
 | `LIST_VERP` | With `DKIM2_SIGN_DAEMON`: the signing pass gives each list copy mailman's VERP envelope sender, `<list>-bounces+<local>=<domain>@`, so a bounce names the subscriber. `yes` to turn on. See below. |
 
 `DKIM2_AUTHSERV_ID` is the *authserv-id* of RFC 8601: the first thing in an

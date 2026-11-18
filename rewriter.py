@@ -51,6 +51,19 @@ dkim2_sign_daemon = os.environ.get("DKIM2_SIGN_DAEMON", "")
 #   an envelope sender in mailman's VERP format, <list>-bounces+<local>=
 #   <domain>@, so a bounce names the subscriber it is for
 list_verp = os.environ.get("LIST_VERP", "").lower() in ("1", "yes", "true", "on")
+
+
+def munge_from_setting(value):
+    # on unless it says otherwise: unset or empty keeps today's behaviour
+    return (value or "").strip().lower() not in ("no", "false", "0", "off")
+
+
+# DKIM1_MUNGE_FROM: take over the From of a sender whose domain publishes
+#   DMARC p=reject or p=quarantine (the DKIM1-era "munge").  On by default.
+#   Off (no, false, 0 or off), From is rewritten only for DKIM2, by the list
+#   From rule; mail DKIM2 does not cover keeps the author's From and may
+#   fail DMARC at receivers that do not understand DKIM2
+dkim1_munge_from = munge_from_setting(os.environ.get("DKIM1_MUNGE_FROM"))
 # where keys are looked up: None is the DNS; the tests give a table
 dkim2_dns = None
 # how the chain a message arrived with checked out, carried through mailman
@@ -678,7 +691,9 @@ class EnvelopeMilter(Milter.Base):
         # a message we pass on from someone else's domain (alias forward,
         # reply to a wrapped address): take over a p=reject/quarantine From,
         # or just the envelope when only SPF would fail
-        if check_dmarc(hdr_from_addr):
+        if not dkim1_munge_from:
+            logging.debug(f"{queue_id} debug: DKIM1_MUNGE_FROM is off, From not rewritten for DMARC [{self.id}]")
+        if dkim1_munge_from and check_dmarc(hdr_from_addr):
             new_hdr_from_addr = wrap_addr(hdr_from_addr, forwarding_domain)
             # nobody replies to a bounce, so no wrap entry for it
             if env_from_addr:
@@ -1032,7 +1047,9 @@ class EnvelopeMilter(Milter.Base):
             except KeyError:
                 rewrite_domain = forwarding_domain
             logging.info(f"rewrite domain is {rewrite_domain}")
-            if check_dmarc(hdr_from_addr) or (
+            if not dkim1_munge_from:
+                logging.debug(f"{queue_id} debug: DKIM1_MUNGE_FROM is off, From not rewritten for DMARC [{self.id}]")
+            if (dkim1_munge_from and check_dmarc(hdr_from_addr)) or (
                     list_fanout and self.dkim2_wants_new_from(hdr_from_addr, env_from_addr)):
                 new_hdr_from_addr = wrap_addr(hdr_from_addr, forwarding_domain)
                 self.change_header_from(_hdr_from_name, new_hdr_from_addr)

@@ -50,6 +50,10 @@ spec:
               value: {{ .Values.rewriter.mailmanSaslUser }}
             - name: IGNORELIST
               value: {{ .Values.rewriter.ignoreList }}
+            {{- if eq (toString .Values.rewriter.dkim1MungeFrom) "false" }}
+            - name: DKIM1_MUNGE_FROM
+              value: "no"
+            {{- end }}
             {{- with .Values.rewriter.dkim2 }}
             {{- if .authservId }}
             - name: DKIM2_AUTHSERV_ID
