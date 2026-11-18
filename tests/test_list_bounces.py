@@ -115,3 +115,41 @@ def test_fanout_records_no_envelope_wrap(run, env_from):
     assert report["envelope_from"] == f"{local}=40ietf.org@{FWD}"
     # only the header From's wrap, which replies need
     assert [w["email"] for w in report["db_writes"]] == [f"alice=40example.com@{FWD}"]
+
+
+# --- only our own lists ---------------------------------------------------------------
+# A wrapped list bounce is restored with addrcpt(), past Postfix's RCPT
+# checks, and with no record of the wrap.  Its inner domain must therefore be
+# one of our list domains, or anyone could relay to <x-bounces@any.domain>
+FOREIGN_LIST_BOUNCES = [
+    pytest.param(f"x-bounces=40victim.example@{FWD}", id="plain"),
+    pytest.param(f"x-bounces+a=b.test=40victim.example@{FWD}", id="verp"),
+    pytest.param(f"ietf-bounces=40ietf.org.victim.example@{FWD}", id="our-domain-as-prefix"),
+    pytest.param(f"ietf-bounces=40sub.ietf.org@{FWD}", id="our-subdomain"),
+]
+
+
+def refused(report):
+    return {x["recipient"]: x["reply"] for x in report["refused_recipients"]}
+
+
+@pytest.mark.parametrize("rcpt", FOREIGN_LIST_BOUNCES)
+def test_foreign_list_bounce_wrap_refused_at_rcpt(run, rcpt):
+    report = run("--from", "MAILER-DAEMON@x.test", "-f", "", "--to", rcpt, "a@ietf.org")
+    assert refused(report) == {rcpt: "550 5.1.1 unknown wrapped address"}
+    assert report["recipients"] == ["a@ietf.org"]
+    assert not [a for a in report["milter_actions"] if a[0] in ("delrcpt", "addrcpt")]
+
+
+@pytest.mark.parametrize("rcpt", FOREIGN_LIST_BOUNCES)
+def test_foreign_list_bounce_wrap_is_not_ours(rewriter, rcpt):
+    assert not rewriter.is_wrapped_list_bounce(rcpt)
+
+
+def test_foreign_list_bounce_wrap_left_in_headers(run):
+    foreign = f"x-bounces=40victim.example@{FWD}"
+    report = run("--from", "MAILER-DAEMON@x.test", "-f", "",
+                 "--to", f"ietf-bounces=40ietf.org@{FWD}",
+                 "--header", f"Cc: {foreign}")
+    assert report["recipients"] == ["ietf-bounces@ietf.org"]
+    assert [v for n, v in report["headers"] if n.lower() == "cc"] == [foreign]
