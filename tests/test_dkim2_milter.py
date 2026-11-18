@@ -276,11 +276,12 @@ def test_unwrapped_to_is_recorded_when_we_do_not_sign(dkim2, keys, our_key_only)
     assert [f.split(b";")[0].split(b"=")[1] for f in sent.named("Message-Instance")] == [b"2", b"1"]
     assert dkim2hop.stream(sent.fields, BODY, dns=dkim2.dkim2_dns, arriving=False).result().status == "pass"
 
-    # mailman records its changes on top, and the fan-out signs for all three
+    # mailman records its changes on top, the fan-out adds its own to
+    # mailman's instance, and signs for all three
     out, body = through_mailman(sent.fields)
     copy = send(dkim2, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
-    assert [f.split(b";")[0].split(b"=")[1] for f in copy.named("Message-Instance")] == [b"4", b"3", b"2", b"1"]
-    assert [copy.tag("DKIM2-Signature", "i"), copy.tag("DKIM2-Signature", "m")] == ["2", "4"]
+    assert [f.split(b";")[0].split(b"=")[1] for f in copy.named("Message-Instance")] == [b"3", b"2", b"1"]
+    assert [copy.tag("DKIM2-Signature", "i"), copy.tag("DKIM2-Signature", "m")] == ["2", "3"]
     assert copy.value("From") == f"Alice <{WRAPPED}>"
     result = verified(dkim2, copy)
     assert result.status == "pass", result.message
@@ -343,15 +344,15 @@ def test_changes_are_recorded_on_a_chain_that_failed(dkim2, keys, our_key_only):
 
 def test_footer_means_new_from_and_a_verifiable_chain(dkim2, keys):
     """The body changed since example.com signed, so the copy leaves with a
-    From of ours, an instance recording the old From, and our signature."""
+    From of ours, recorded in mailman's instance, and our signature."""
     arrived = fields(("X-DKIM2-Arrival", "pass")) + author_post(keys)
     out, body = through_mailman(arrived)
     sent = send(dkim2, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
 
     assert sent.value("From") == f"Alice <{WRAPPED}>"
     assert sent.value("X-Original-From") == f"Alice <{AUTHOR}>"
-    assert [sent.tag("Message-Instance", "m"), sent.tag("DKIM2-Signature", "i")] == ["3", "2"]
-    assert sent.tag("DKIM2-Signature", "m") == "3"
+    assert [sent.tag("Message-Instance", "m"), sent.tag("DKIM2-Signature", "i")] == ["2", "2"]
+    assert sent.tag("DKIM2-Signature", "m") == "2"
     assert sent.tag("DKIM2-Signature", "d") == "ietf.org"
     assert sent.tag("DKIM2-Signature", "f") == "exploded"
     # the signature names the envelope the copy actually leaves in
@@ -365,22 +366,22 @@ def test_body_the_list_could_not_describe_is_still_signed(dkim2, keys):
     """Mailman rewrote the body and recorded only that it did (a null body
     Recipe).  The body is not the one example.com signed and cannot be put
     back, but the copy came to us from our own list manager: it gets a From
-    of ours and our signature over mailman's instance and ours.  Verifiers
+    of ours, recorded in mailman's instance, and our signature.  Verifiers
     report a null Recipe as a permerror (-09), which is the truth."""
     arrived = fields(("X-DKIM2-Arrival", "pass")) + author_post(keys)
     out, body = through_mailman(arrived, null_body=True)
     sent = send(dkim2, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
     assert sent.value("From") == f"Alice <{WRAPPED}>"
-    assert [f.split(b";")[0].split(b"=")[1] for f in sent.named("Message-Instance")] == [b"3", b"2", b"1"]
-    assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["2", "3"]
+    assert [f.split(b";")[0].split(b"=")[1] for f in sent.named("Message-Instance")] == [b"2", b"1"]
+    assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["2", "2"]
     result = verified(dkim2, sent)
     assert result.status == "permerror" and "m=2 has a null recipe" in result.message
 
 
 def test_unsigned_post_with_the_lists_instance_is_signed_over_it(dkim2, monkeypatch):
     """Nobody signed the post; mailman's m=1 describes what it handed us.
-    The DMARC rule gives the copy a From of ours, and our m=2 and i=1
-    cover mailman's instance too: it is not thrown away."""
+    The DMARC rule gives the copy a From of ours, recorded in mailman's
+    m=1, and i=1 covers it: it is not thrown away."""
     pins = harness.parse_pins(["example.com=reject"], "--dmarc")
     monkeypatch.setattr(dkim2, "checkdmarc", harness.LoggedCheckdmarc(harness.FakeDNS(pins, {}, True)))
     dkim2._policy_cache.clear()
@@ -389,8 +390,8 @@ def test_unsigned_post_with_the_lists_instance_is_signed_over_it(dkim2, monkeypa
     out, body = through_mailman(plain)
     sent = send(dkim2, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
     assert sent.value("From") == f"Alice <{WRAPPED}>"
-    assert [f.split(b";")[0].split(b"=")[1] for f in sent.named("Message-Instance")] == [b"2", b"1"]
-    assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["1", "2"]
+    assert [f.split(b";")[0].split(b"=")[1] for f in sent.named("Message-Instance")] == [b"1"]
+    assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["1", "1"]
     result = verified(dkim2, sent)
     assert result.status == "pass", result.message
 

@@ -34,6 +34,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "dkim2"))
 
 import dkim2sign  # noqa: E402
+import dkim2undo  # noqa: E402
 import dkim2verify  # noqa: E402
 from dkim2dns import LiveDNS  # noqa: E402
 
@@ -272,17 +273,20 @@ class Signed:
 
     insert   header fields to put at the top of the message, topmost first,
              as (name, value) with LF line breaks, ready for insheader()
-    reason   why nothing was signed, when insert is empty
+    change   header fields to rewrite in place, as (name, index, value) for
+             chgheader() (index counts fields of that name from the top, from 1)
+    reason   why nothing was signed, when insert and change are empty
     domain   the signing domain
     """
 
-    def __init__(self, insert=(), reason=None, domain=None):
+    def __init__(self, insert=(), reason=None, domain=None, change=()):
         self.insert = list(insert)
+        self.change = list(change)
         self.reason = reason
         self.domain = domain
 
     def __bool__(self):
-        return bool(self.insert)
+        return bool(self.insert or self.change)
 
 
 _BASE64_TAGS = ("r", "s", "h", "mf", "rt")
@@ -358,11 +362,60 @@ def _instances(seen, after):
     return [f.encode("utf-8") + CRLF for f in [mine] + first]
 
 
+def _merged(seen, after):
+    """The list manager's Message-Instance with the rewriter's changes
+    folded in, as (index among the Message-Instance fields from the top,
+    field), or None to record them in an instance of our own.
+
+    A list copy is changed twice by the same organisation in the same hop:
+    by the list manager, which says so in an instance nobody has signed, and
+    by the rewriter (a From of ours).  One instance says it all: the top
+    one keeps its m=, gets the hashes of the copy as it leaves, and a
+    header Recipe back to the message as the list received it (the list
+    manager's Recipe applied first, then the difference worked out again).
+    Its body Recipe is the list manager's: the rewriter does not change the
+    body.  None when nothing DKIM2 hashes changed, when a signature already
+    covers the top instance (it is not ours to rewrite), or when the
+    instance cannot be taken apart (a null header Recipe, an algorithm we
+    did not hash the body with).
+    """
+    before = _bare(seen.fields)
+    if dkim2sign.compute_header_hash(before) == dkim2sign.compute_header_hash(_bare(after)):
+        return None
+    instances = [f.decode("utf-8", "surrogateescape") for f in after
+                 if _name(f) == b"message-instance"]
+    signatures = [f.decode("utf-8", "surrogateescape") for f in after
+                  if _name(f) == b"dkim2-signature"]
+    if not instances or dkim2sign.chain_range_error(instances, signatures):
+        return None
+    versions = [dkim2sign._get_version_from_mi(f) for f in instances]
+    top = max(versions)
+    if any(dkim2sign._get_version_from_mi(f) >= top for f in signatures):
+        return None
+    field = instances[versions.index(top)]
+    try:
+        recipe = dkim2undo.decode_recipes(field) or {}
+        previous = before
+        if "h" in recipe:
+            previous = dkim2undo.reconstruct_headers(before, recipe["h"])
+        sets = "".join(dkim2sign._extract_tag(field.split(":", 1)[1], "h").split())
+        body_hashes = {s.split(":", 1)[0]: seen.body_hash(s.split(":", 1)[0])
+                       for s in sets.split(",")}
+    except (ValueError, KeyError, AttributeError):
+        return None
+    merged = dkim2sign.build_recipes(previous, b"", _bare(after), b"") or {}
+    if "b" in recipe:
+        merged["b"] = recipe["b"]
+    mine = dkim2sign.build_message_instance_from_hashes(
+        _bare(after), body_hashes, version=top, recipe=merged or None)
+    return versions.index(top) + 1, mine.encode("utf-8") + CRLF
+
+
 def _has_chain(header_fields):
     return any(_name(f) in (b"message-instance", b"dkim2-signature") for f in header_fields)
 
 
-def record(seen, after):
+def record(seen, after, merge=False):
     """Record a change the rewriter is not signing for.
 
     Whenever the rewriter changes a header field DKIM2 hashes it says so
@@ -374,10 +427,11 @@ def record(seen, after):
     message says what we did.  A later hop of ours (the list fan-out)
     signs over it.
 
-    seen and after are sign()'s.  Returns a Signed with the fields to
-    insert, or with .reason when there is nothing to record (no hashed
-    header field changed) or no way to (the body was not hashed, or the
-    instances on the message are not numbered as a chain).
+    seen, after and merge are sign()'s.  Returns a Signed with the fields
+    to insert (or, merging, the list's instance to change), or with .reason
+    when there is nothing to record (no hashed header field changed) or no
+    way to (the body was not hashed, or the instances on the message are not
+    numbered as a chain).
     """
     if not seen.hashed:
         return Signed(reason="the body was not hashed")
@@ -387,6 +441,10 @@ def record(seen, after):
         [f for f in existing if f.lower().startswith("dkim2-signature:")])
     if numbering:
         return Signed(reason=clean(numbering))
+    merged = _merged(seen, after) if merge else None
+    if merged:
+        idx, field = merged
+        return Signed(change=[("Message-Instance", idx, _for_milter(field)[1])])
     mine = _instances(seen, after)
     if not mine:
         return Signed(reason="no hashed header field changed")
@@ -394,7 +452,7 @@ def record(seen, after):
 
 
 def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
-         timestamp=None, selector=None):
+         timestamp=None, selector=None, merge=False):
     """Sign a message the rewriter is sending on.
 
     seen     the Stream the message came through: its header fields as the
@@ -408,6 +466,9 @@ def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
     keydir, selector
              see find_key()
     exploded the message is one of many copies (a list's fan-out)
+    merge    the message is a copy our list manager handed us: put the
+             rewriter's changes into its unsigned instance (_merged())
+             rather than one of our own above it
 
     The rewriter's header changes are recorded first (_instances()), and
     the signature covers every instance below it, so instances nobody
@@ -430,7 +491,16 @@ def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
 
     if not seen.hashed:
         return Signed(reason="the body was not hashed", domain=domain)
-    mine = _instances(seen, after)
+    change = []
+    merged = _merged(seen, after) if merge else None
+    if merged:
+        idx, field = merged
+        at = [i for i, f in enumerate(after) if _name(f) == b"message-instance"][idx - 1]
+        after = after[:at] + [field] + after[at + 1:]
+        change = [("Message-Instance", idx, _for_milter(field)[1])]
+        mine = []
+    else:
+        mine = _instances(seen, after)
     after = mine + after
     body_hashes = {"sha256": seen.body_hash("sha256")}
 
@@ -450,4 +520,4 @@ def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
 
     return Signed(insert=[_for_milter(f.encode("utf-8")) for f in added]
                   + [_for_milter(f) for f in mine],
-                  domain=domain)
+                  change=change, domain=domain)
