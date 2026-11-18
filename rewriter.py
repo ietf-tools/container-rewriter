@@ -916,23 +916,40 @@ class EnvelopeMilter(Milter.Base):
             self.verp(queue_id)
             if not dkim2_keydir:
                 self.dkim2_strip(queue_id)
-            elif not self.dkim2_off and self.offsite_rcpts():
-                # set only by the first pass (which replaces one from
-                # outside) or by mailman, which we trust to relay it
-                self.dkim2_arrival_status = self.dkim2_arrival_field()
-                if self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
-                    logging.info(f"{queue_id} dkim2 sign pass: not signing, arrival was "
-                                 f"{self.dkim2_arrival_status} [{self.id}]")
-                elif self.exploded_marks and not self.list_instance():
-                    logging.info(f"{queue_id} dkim2 sign pass: not signing: the list gave no "
-                                 f"Message-Instance [{self.id}]")
-                else:
-                    self.dkim2_signed(queue_id, exploded=self.exploded_marks > 0)
+            elif self.offsite_rcpts() and not self.dkim2_sign_pass_signed(queue_id):
+                # every off-site copy comes through here, and one we do not
+                # sign is not sent on with a chain that will not verify
+                # (-09 section 13.1): no DKIM2 at all instead
+                self.dkim2_strip(queue_id, "dkim2 sign pass: not signed")
             for idx in range(self.exploded_marks, 0, -1):
                 self.chgheader(DKIM2_EXPLODED, idx, None)
         except Exception:
             logging.exception(f"{queue_id} dkim2 sign pass: error, sending it on unsigned [{self.id}]")
+            try:
+                self.dkim2_strip(queue_id, "dkim2 sign pass: not signed")
+            except Exception:
+                logging.exception(f"{queue_id} dkim2 sign pass: could not remove the chain [{self.id}]")
         return Milter.ACCEPT
+
+    def dkim2_sign_pass_signed(self, queue_id):
+        # the signing pass's decision: True only when the copy now carries
+        # our signature
+        if self.dkim2_off:
+            return False
+        # set only by the first pass (which replaces one from outside) or
+        # by mailman, which we trust to relay it
+        self.dkim2_arrival_status = self.dkim2_arrival_field()
+        if self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
+            logging.info(f"{queue_id} dkim2 sign pass: not signing, arrival was "
+                         f"{self.dkim2_arrival_status} [{self.id}]")
+            return False
+        if self.exploded_marks and not self.list_instance():
+            logging.info(f"{queue_id} dkim2 sign pass: not signing: the list gave no "
+                         f"Message-Instance [{self.id}]")
+            return False
+        # dkim2_signed() answers True after an error too (it gave up on
+        # DKIM2): nothing was signed then
+        return self.dkim2_signed(queue_id, exploded=self.exploded_marks > 0) and not self.dkim2_off
 
     def verp(self, queue_id):
         # one copy for one recipient: a list's -bounces sender becomes the
@@ -950,8 +967,9 @@ class EnvelopeMilter(Milter.Base):
         except Exception:
             logging.exception(f"{queue_id} verp: error, Envelope-From left as {env_from} [{self.id}]")
 
-    def dkim2_strip(self, queue_id):
-        # no key to sign with: remove the whole chain, which leaves a
+    def dkim2_strip(self, queue_id, why="dkim2: no signing keys"):
+        # nothing of ours will sign this copy (no key at all, or the signing
+        # pass did not sign it): remove the whole chain, which leaves a
         # message with no DKIM2 at all rather than one that fails
         # (draft-ietf-dkim-dkim2-spec-09 13.1, 14.2).  Each field is
         # removed by its index among those of its name, last first
@@ -961,7 +979,7 @@ class EnvelopeMilter(Milter.Base):
                 self.chgheader(name, idx, None)
                 removed += 1
         if removed:
-            logging.info(f"{queue_id} dkim2: no signing keys, removed {removed} DKIM2 header fields [{self.id}]")
+            logging.info(f"{queue_id} {why}, removed {removed} DKIM2 header fields [{self.id}]")
 
     def dkim2_record(self, queue_id, merge=False):
         # we are not signing, but we may have changed header fields DKIM2

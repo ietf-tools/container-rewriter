@@ -90,6 +90,16 @@ that fails (draft-ietf-dkim-dkim2-spec-09 sections 13.1 and 14.2). The
 signing pass does the same to every copy. A message delivered unchanged to
 a local list keeps its chain for mailman.
 
+**In split-then-sign mode, with keys,** the signing pass does the same to any
+copy it does not sign: an arrival that failed, a list copy with no
+`Message-Instance` from the list, no key for the envelope domain, a chain the
+signer refuses (a list that changed the post without recording it, or one
+carrying the rewriter's own arrival-side instance through such a list), or an
+error. Every off-site copy passes through it, so none leaves with a chain
+that will not verify; it is logged as `dkim2 sign pass: not signed, removed
+N DKIM2 header fields`. The first pass still records, since a later hop of
+ours may sign over it.
+
 ## What it relies on
 
 - **Forged local senders are refused before the rewriter sees them.** The
