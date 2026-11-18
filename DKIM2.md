@@ -60,8 +60,11 @@ case the change is recorded:
 
 - a message that has `Message-Instance` fields gets the next one, with the
   Recipe that undoes the change;
-- a message with none gets `m=1` for the message as it was handed over and
-  `m=2` with the Recipe;
+- a message with none enters DKIM2 here and gets a single `m=1` for the
+  message as it leaves, with the Recipe back to the message as it was handed
+  over (-09 section 12.1 lets the first instance carry Recipes, and one
+  system's changes belong in one instance). A forward we sign is `m=1` with
+  `i=1; m=1`;
 - a list's fan-out (below) gets no instance of its own: the change goes
   into mailman's.
 

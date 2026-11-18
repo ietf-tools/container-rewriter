@@ -339,8 +339,10 @@ def _instances(seen, after):
     of our own hops' (the rewriter on arrival, the list manager), handed
     to us over a path we trust.
 
-    A message with none gets two: m=1 for the message as we were handed
-    it, and m=2 with the Recipe back to that.
+    A message with none enters DKIM2 here, and gets one: m=1 for the
+    message as we send it, with the Recipe back to the message as we were
+    handed it (-09 section 12.1: the first instance MAY carry Recipes, and
+    one system's changes belong in one instance).
     """
     before = seen.fields
     if (dkim2sign.compute_header_hash(_bare(before))
@@ -349,17 +351,12 @@ def _instances(seen, after):
     body_hashes = {"sha256": seen.body_hash("sha256")}
     instances = [f.decode("utf-8", "surrogateescape") for f in after
                  if _name(f) == b"message-instance"]
-    first = []
-    if instances:
-        version = max(dkim2sign._get_version_from_mi(f) for f in instances) + 1
-    else:
-        first = [dkim2sign.build_message_instance_from_hashes(_bare(before), body_hashes)]
-        version = 2
+    version = max((dkim2sign._get_version_from_mi(f) for f in instances), default=0) + 1
     # header fields only: the body is the one we were given
     recipe = dkim2sign.build_recipes(_bare(before), b"", _bare(after), b"")
     mine = dkim2sign.build_message_instance_from_hashes(
         _bare(after), body_hashes, version=version, recipe=recipe)
-    return [f.encode("utf-8") + CRLF for f in [mine] + first]
+    return [mine.encode("utf-8") + CRLF]
 
 
 def _merged(seen, after):
@@ -476,7 +473,8 @@ def sign(seen, after, mail_from, rcpt_to, keydir, exploded=False,
     manager's -- are answered for here: they reached us over a path we
     trust.  They must still describe the message: a chain that does not
     verify is not signed (-09 section 12).  A message with no DKIM2 fields
-    that the rewriter did not change gets m=1 and i=1.
+    gets m=1 and i=1, the m=1 with a Recipe for whatever the rewriter
+    changed.
 
     Returns a Signed.  Nothing is signed (and .reason says why) when there
     is no key for the sender's domain, the sender is null, the existing

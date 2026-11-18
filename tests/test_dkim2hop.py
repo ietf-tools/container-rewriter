@@ -224,17 +224,41 @@ def test_change_we_do_not_sign_is_recorded_in_an_unsigned_instance(keys):
     assert dkim2hop.verify(final, BODY, BOUNCES, ["sub@example.net"], dns).status == "pass"
 
 
-def test_change_to_a_message_with_no_chain_is_recorded_from_m1(keys):
+def test_change_to_a_message_with_no_chain_is_recorded_in_m1(keys):
+    """The message enters DKIM2 here: one m=1 for the message as we send
+    it, whose Recipe gives back the message as it was handed to us
+    (-09 section 12.1: the first instance MAY carry Recipes)."""
     _keydir, dns = keys
     plain = fields(("From", "a@example.com"), ("To", LIST))
     changed = fields(("From", "a@example.com"), ("To", "someone@example.net"))
     recorded = dkim2hop.record(dkim2hop.stream(plain, BODY, "a@example.com", [LIST], dns), changed)
-    assert [n for n, _v in recorded.insert] == ["Message-Instance", "Message-Instance"]
+    assert [n for n, _v in recorded.insert] == ["Message-Instance"]
     sent = apply(recorded, changed)
-    assert [tag(f, "m") for f in named(sent, b"message-instance")] == ["2", "1"]
-    # m=1 is the message as it was handed to us: nothing to undo
-    assert tag(named(sent, b"message-instance")[1], "r") is None
+    assert [tag(f, "m") for f in named(sent, b"message-instance")] == ["1"]
+    recipe = json.loads(base64.b64decode(tag(named(sent, b"message-instance")[0], "r")))
+    assert list(recipe) == ["h"] and [s.strip() for s in recipe["h"]["to"][0]["d"]] == [LIST]
     assert dkim2hop.stream(sent, BODY, dns=dns, arriving=False).result().status == "pass"
+
+
+def test_first_signature_over_a_change_is_i1_m1(keys):
+    """A message with no chain whose From we take over (an alias forward):
+    one instance and one signature, i=1; m=1."""
+    keydir, dns = keys
+    before = fields(("From", "Alice <alice@example.com>"), ("To", LIST))
+    after = [dkim2hop.header_field("From", "Alice <alice=40example.com@dmarc.ietf.org>")
+             if dkim2hop._name(f) == b"from" else f for f in before]
+    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False), after,
+                           "forwardingalgorithm@ietf.org", ["sub@example.net"], keydir, timestamp=T)
+    assert signed, signed.reason
+    assert [n for n, _v in signed.insert] == ["DKIM2-Signature", "Message-Instance"]
+    sent = apply(signed, after)
+    assert [tag(f, "m") for f in named(sent, b"message-instance")] == ["1"]
+    top_sig = named(sent, b"dkim2-signature")[0]
+    assert (tag(top_sig, "i"), tag(top_sig, "m")) == ("1", "1")
+    recipe = json.loads(base64.b64decode(tag(named(sent, b"message-instance")[0], "r")))
+    assert [s.strip() for s in recipe["h"]["from"][0]["d"]] == ["Alice <alice@example.com>"]
+    result = dkim2hop.verify(sent, BODY, "forwardingalgorithm@ietf.org", ["sub@example.net"], dns)
+    assert result.status == "pass", result.message
 
 
 def test_change_to_a_chain_that_failed_is_still_recorded(keys):
