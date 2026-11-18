@@ -396,15 +396,40 @@ def test_unsigned_post_with_the_lists_instance_is_signed_over_it(dkim2, monkeypa
     assert result.status == "pass", result.message
 
 
-def test_no_footer_keeps_the_authors_from(dkim2, keys):
-    """Headers changed, the body did not: example.com still answers for the
-    content, so From stays and we only add our signature."""
+def test_header_changes_alone_mean_new_from(dkim2, keys):
+    """The list tagged the subject and added List-Id but left the body
+    alone: it still changed the post, so (as mailman's own rule says) the
+    copy gets a From of ours and our signature."""
     arrived = fields(("X-DKIM2-Arrival", "pass")) + author_post(keys)
     out, body = through_mailman(arrived, footer=b"")
     sent = send(dkim2, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
-    assert sent.value("From") == f"Alice <{AUTHOR}>"
-    assert sent.mail_from == BOUNCES
+    assert sent.value("From") == f"Alice <{WRAPPED}>"
     assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["2", "2"]
+    result = verified(dkim2, sent)
+    assert result.status == "pass", result.message
+
+
+def test_signed_post_unchanged_keeps_its_from(dkim2, keys):
+    """Handed back exactly as the author signed it: the author still
+    answers for it."""
+    arrived = fields(("X-DKIM2-Arrival", "pass")) + author_post(keys)
+    sent = send(dkim2, arrived, BODY, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
+    assert sent.value("From") == f"Alice <{AUTHOR}>"
+
+
+def test_unsigned_post_through_the_list_gets_our_from(dkim2, monkeypatch):
+    """Mailman's rule, mirrored: a post nobody signed that the list hands
+    back with its m=1 gets a From of ours and our signature, with or
+    without DMARC munging."""
+    monkeypatch.setattr(dkim2, "dkim1_munge_from", False)
+    plain = fields(("X-DKIM2-Arrival", "none"), ("From", f"Alice <{AUTHOR}>"), ("To", LIST),
+                   ("Subject", "hello"))
+    out, body = through_mailman(plain)
+    sent = send(dkim2, out, body, BOUNCES, [SUBSCRIBER], auth=MAILMAN)
+    assert sent.value("From") == f"Alice <{WRAPPED}>"
+    assert sent.value("X-Original-From") == f"Alice <{AUTHOR}>"
+    assert versions(sent) == ["1"]
+    assert [sent.tag("DKIM2-Signature", "i"), sent.tag("DKIM2-Signature", "m")] == ["1", "1"]
     result = verified(dkim2, sent)
     assert result.status == "pass", result.message
 

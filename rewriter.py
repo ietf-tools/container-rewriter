@@ -764,20 +764,21 @@ class EnvelopeMilter(Milter.Base):
 
     def dkim2_wants_new_from(self, hdr_from_addr, env_from_addr):
         # a list copy we are going to sign needs a From in our own domain
-        # when the body is not the one the last DKIM2 signature covered
-        # (mailman added a footer): we answer for the message then.  A post
-        # nobody signed keeps its From, and so goes out without our
-        # signature unless the DMARC rule rewrites it; a From already ours
-        # is left alone
+        # when nobody signed the post, or the list changed it since the last
+        # DKIM2 signature (a footer, a subject tag, List-* fields): we answer
+        # for the message then.  This is the decision mailman makes itself
+        # (_dkim2_rewrites_from) unless it defers From to us, and it does not
+        # depend on DMARC or DKIM1_MUNGE_FROM.  A From already ours is left
+        # alone
         if self.dkim2_off or not dkim2_keydir or self.dkim2_arrival_status in DKIM2_NOT_VERIFIED:
             return False
         try:
-            return self.dkim2_body_changed(hdr_from_addr, env_from_addr)
+            return self.dkim2_changed_since_signature(hdr_from_addr, env_from_addr)
         except Exception:
             self.dkim2_give_up("the From rule")
             return False
 
-    def dkim2_body_changed(self, hdr_from_addr, env_from_addr):
+    def dkim2_changed_since_signature(self, hdr_from_addr, env_from_addr):
         from_domain = hdr_from_addr.rsplit("@", 1)[-1].lower()
         if check_local(hdr_from_addr) or from_domain == forwarding_domain.lower():
             return False
@@ -793,7 +794,7 @@ class EnvelopeMilter(Milter.Base):
         # behind it helps nobody
         if seen.result().status != "pass":
             return False
-        return seen.body_changed_since_signature()
+        return seen.changed_since_signature()
 
     def dkim2_sign(self, queue_id, exploded):
         # last of all: sign for the envelope the message leaves in, or at

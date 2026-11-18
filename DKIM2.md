@@ -114,23 +114,34 @@ as if DKIM2 were not configured: no verdict, no signature.
 ## The From rule
 
 A list copy's From is rewritten to `user=40domain@<FORWARDING_DOMAIN>`, as it
-already is for a sender with a DMARC `reject` or `quarantine` policy, in one
-more case when signing is on: **the body is no longer the one the last DKIM2
-signature covered.** A footer is the usual cause. Whoever sends a changed
-body on answers for the message, and under DKIM2 that is expressed by From.
+already is for a sender with a DMARC `reject` or `quarantine` policy, in two
+more cases when signing is on:
 
-A post with no DKIM2 signature is not rewritten for that reason alone. Its
-From stays the author's, and since that From is not in our domain the copy
-goes out without our signature, as today. If the DMARC rule rewrites it, it
-is signed, and the chain starts with us.
+- **nobody signed the post with DKIM2**, and mailman recorded its
+  `Message-Instance` (`dkim2_message_instance` on). The copy starts the
+  chain, and we can only sign for a From in our own domain;
+- **the post changed since the last DKIM2 signature**, by the list or by
+  the rewriter on arrival: its hashed header fields (a subject tag, `List-*`
+  fields, an unwrapped To) or its body (a footer) no longer hash as they did
+  in the instance that signature covers.
+
+Whoever sends a changed message on answers for it, and under DKIM2 that is
+expressed by From. This is the decision the mailman fork makes itself
+(`_dkim2_rewrites_from`) on a list with `dkim2_message_instance` on, unless
+its `dmarc_mitigate_action` is `defer_to_mta`; with that setting mailman
+leaves From to the rewriter, which decides the same way. It does not depend
+on the author's DMARC policy or on `DKIM1_MUNGE_FROM`. In practice almost
+every list copy we can sign gets a From of ours, since mailman adds hashed
+`List-*` fields; a post handed back unchanged keeps the author's From.
 
 The rule applies to mailman fan-out only. Alias forwarding keeps its existing
 rules. With `DKIM1_MUNGE_FROM=no` this rule is the only one that rewrites
 From.
 
 The From is only taken over when the copy will be signed: if the chain
-mailman hands back does not verify (stock Mailman, below), From and the
-envelope are left as they are.
+mailman hands back does not verify as `pass` (stock Mailman, below, or a list
+with `dkim2_message_instance` off, whose unsigned post carries no instance),
+From and the envelope are left as they are.
 
 ## The trusted path
 
@@ -194,7 +205,7 @@ unknown `X-` fields through.
 | `DKIM2_KEYDIR` | Turns on signing. A directory with one sub-directory per signing domain. |
 | `DKIM2_SELECTOR` | The selector to sign with: the key is `<DKIM2_KEYDIR>/<signing domain>/<DKIM2_SELECTOR>.key`. If unset, the newest `.key` file in the domain's directory is used, and its name is the selector. See below. |
 | `DKIM2_SIGN_DAEMON` | Split then sign. Mail is signed only on connections whose `{daemon_name}` macro equals this; everything else is rewritten and recorded, never signed. Unset, mail is signed in the transaction that relays it off-site. See below. |
-| `DKIM1_MUNGE_FROM` | On by default: From is rewritten for a sender whose domain publishes DMARC `p=reject` or `p=quarantine`. `no` turns that off, so From is rewritten only by the From rule below, on a list fan-out. Mail DKIM2 does not cover (alias forwards, unsigned posts, posts from domains without DKIM2) then keeps the author's From, and may fail DMARC at receivers that do not understand DKIM2. Helm: `rewriter.dkim1MungeFrom: false`. |
+| `DKIM1_MUNGE_FROM` | On by default: From is rewritten for a sender whose domain publishes DMARC `p=reject` or `p=quarantine`. `no` turns that off, so From is rewritten only by the From rule (above), on a list fan-out: there, with a signing key, a post nobody signed with DKIM2 or one the list changed still gets a From of ours, as long as mailman recorded its `Message-Instance`. What then keeps the author's From is alias forwards, and list copies whose chain does not verify or carries no instance from the list (stock Mailman, `dkim2_message_instance` off); those may fail DMARC at receivers that do not understand DKIM2. Helm: `rewriter.dkim1MungeFrom: false`. |
 | `LIST_VERP` | With `DKIM2_SIGN_DAEMON`: the signing pass gives each list copy mailman's VERP envelope sender, `<list>-bounces+<local>=<domain>@`, so a bounce names the subscriber. `yes` to turn on. See below. |
 
 `DKIM2_AUTHSERV_ID` is the *authserv-id* of RFC 8601: the first thing in an

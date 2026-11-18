@@ -198,21 +198,24 @@ class Stream:
         """The body's hash, or None if the body was not hashed."""
         return self._hasher.digest(alg) if self.hashed else None
 
-    def body_changed_since_signature(self):
-        """Is the body no longer the one the newest DKIM2-Signature covered?
+    def changed_since_signature(self):
+        """Has the message changed since the newest DKIM2-Signature, or did
+        nobody sign it?
 
         The newest signature names a Message-Instance (its m=), which holds
-        the body hash from when that signature was made.  True when the
-        body hashes differently now: somebody since has changed it, and
-        whoever sends it on answers for the message, so From has to become
-        an address of theirs.  False for a message with no signature (there
-        is nothing to have changed since) and for a chain that cannot be
-        read.
+        the header and body hashes from when that signature was made.  True
+        when either hashes differently now: somebody since has changed the
+        message, and whoever sends it on answers for it, so From has to
+        become an address of theirs.  True too for a message with no
+        signature: whoever sends it on starts the chain.  This is the
+        decision the list manager makes itself (Mailman's
+        _dkim2_rewrites_from) when it does not leave From to us.  False
+        for a chain that cannot be read.
         """
         signatures = [f.decode("utf-8", "surrogateescape") for f in self.fields
                       if _name(f) == b"dkim2-signature"]
         if not signatures:
-            return False
+            return True
         try:
             top = max(signatures, key=dkim2sign._get_seq_from_sig)
             covered = dkim2sign._get_mi_from_sig(top)
@@ -225,7 +228,8 @@ class Stream:
                 sets = dkim2verify.parse_hash_sets(dkim2sign._mi_hashes(text))
                 return not any(
                     body_hash == dkim2sign.b64(self.body_hash(alg))
-                    for alg, _header_hash, body_hash in sets if alg in ("sha256", "sha512"))
+                    and header_hash == dkim2sign.b64(dkim2sign.compute_header_hash(_bare(self.fields), alg))
+                    for alg, header_hash, body_hash in sets if alg in ("sha256", "sha512"))
         except Exception:
             pass
         return False
