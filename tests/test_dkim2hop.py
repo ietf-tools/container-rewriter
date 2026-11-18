@@ -70,7 +70,8 @@ def post(keys, sender="alice@example.com"):
     example.com, addressed to the list."""
     keydir, dns = keys
     before = fields(("From", f"Alice <{sender}>"), ("To", LIST), ("Subject", "hello"))
-    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False), before, sender, [LIST], keydir, timestamp=T)
+    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False),
+                           before, sender, [LIST], keydir, timestamp=T)
     assert signed, signed.reason
     return apply(signed, before)
 
@@ -92,7 +93,8 @@ def test_find_key_nearest_parent(keys):
 def test_unsigned_message_gets_m1_and_i1(keys):
     keydir, dns = keys
     before = fields(("From", "Chair <chair@ietf.org>"), ("To", "bob@example.net"), ("Subject", "x"))
-    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False), before, "chair@ietf.org", ["bob@example.net"],
+    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False),
+                           before, "chair@ietf.org", ["bob@example.net"],
                            keydir, timestamp=T)
     assert [n for n, _v in signed.insert] == ["DKIM2-Signature", "Message-Instance"]
     assert signed.domain == "ietf.org"
@@ -108,7 +110,8 @@ def test_unsigned_message_gets_m1_and_i1(keys):
 def test_inserted_fields_are_folded_for_a_milter(keys):
     keydir, dns = keys
     before = fields(("From", "chair@ietf.org"), ("To", "bob@example.net"))
-    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False), before, "chair@ietf.org", ["bob@example.net"],
+    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False),
+                           before, "chair@ietf.org", ["bob@example.net"],
                            keydir, timestamp=T)
     for _name, value in signed.insert:
         assert "\r" not in value
@@ -126,7 +129,8 @@ def test_from_rewrite_is_recorded_and_signed(keys):
     wrapped = "alice=40example.com@dmarc.ietf.org"
     sending = [dkim2hop.header_field("From", f"Alice <{wrapped}>")
                if dkim2hop._name(f) == b"from" else f for f in arrived]
-    signed = dkim2hop.sign(dkim2hop.stream(arrived, BODY, dns=dns, arriving=False), sending, BOUNCES, ["sub@example.net"],
+    signed = dkim2hop.sign(dkim2hop.stream(arrived, BODY, dns=dns, arriving=False),
+                           sending, BOUNCES, ["sub@example.net"],
                            keydir, exploded=True, timestamp=T)
     assert signed, signed.reason
     assert [n for n, _v in signed.insert] == ["DKIM2-Signature", "Message-Instance"]
@@ -151,7 +155,8 @@ def test_from_rewrite_is_recorded_and_signed(keys):
 def test_unchanged_message_is_signed_over_the_instance_it_has(keys):
     keydir, dns = keys
     arrived = post(keys)
-    signed = dkim2hop.sign(dkim2hop.stream(arrived, BODY, dns=dns, arriving=False), arrived, BOUNCES, ["sub@example.net"],
+    signed = dkim2hop.sign(dkim2hop.stream(arrived, BODY, dns=dns, arriving=False),
+                           arrived, BOUNCES, ["sub@example.net"],
                            keydir, timestamp=T)
     assert [n for n, _v in signed.insert] == ["DKIM2-Signature"]
     sent = apply(signed, arrived)
@@ -290,21 +295,24 @@ def test_nothing_is_recorded_without_a_change_or_a_body_hash(keys):
 def test_no_key_no_signature(keys):
     keydir, dns = keys
     before = fields(("From", "a@elsewhere.test"), ("To", "b@example.net"))
-    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False), before, "a@elsewhere.test", ["b@example.net"], keydir)
+    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False),
+                           before, "a@elsewhere.test", ["b@example.net"], keydir)
     assert not signed and signed.reason == "no signing key for elsewhere.test"
 
 
 def test_null_sender_is_not_signed(keys):
     keydir, dns = keys
     before = fields(("From", "MAILER-DAEMON@ietf.org"), ("To", "b@example.net"))
-    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False), before, "<>", ["b@example.net"], keydir)
+    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False),
+                           before, "<>", ["b@example.net"], keydir)
     assert not signed and "null" in signed.reason
 
 
 def test_from_outside_the_signing_domain_is_refused(keys):
     keydir, dns = keys
     before = fields(("From", "Alice <alice@example.com>"), ("To", "b@example.net"))
-    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False), before, BOUNCES, ["b@example.net"], keydir, timestamp=T)
+    signed = dkim2hop.sign(dkim2hop.stream(before, BODY, dns=dns, arriving=False),
+                           before, BOUNCES, ["b@example.net"], keydir, timestamp=T)
     assert not signed
     assert "From header field is not Authentic for d=ietf.org" in signed.reason
 
@@ -314,7 +322,8 @@ def test_broken_chain_is_not_extended(keys):
     arrived = post(keys)
     tampered = [dkim2hop.header_field("Subject", "something else")
                 if dkim2hop._name(f) == b"subject" else f for f in arrived]
-    signed = dkim2hop.sign(dkim2hop.stream(tampered, BODY, dns=dns, arriving=False), tampered, BOUNCES, ["sub@example.net"],
+    signed = dkim2hop.sign(dkim2hop.stream(tampered, BODY, dns=dns, arriving=False),
+                           tampered, BOUNCES, ["sub@example.net"],
                            keydir, timestamp=T)
     assert not signed and signed.reason.startswith("not signing")
 

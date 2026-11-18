@@ -8,8 +8,7 @@ takes the DKIM2 path only with ALIAS_DKIM2 on, and only when our signature
 can extend the sender's chain."""
 import harness
 from test_dkim2_milter import (AUTHOR, BODY, BOUNCES, FOOTER, LIST, MAILMAN, SUBSCRIBER,  # noqa: F401
-                               UNSIGNED, WRAPPED, author_post, dkim2, fields, keys, send,
-                               through_mailman)
+                               UNSIGNED, WRAPPED, author_post, fields, send, through_mailman)
 
 
 def pin_reject(rw, monkeypatch):
@@ -74,7 +73,7 @@ def test_the_munge_setting_is_gone(rewriter):
 import dkim2hop  # noqa: E402
 import pytest  # noqa: E402
 from test_dkim2_milter import T, verified  # noqa: E402
-from test_dkim2_split import resend, split  # noqa: E402,F401
+from test_dkim2_split import resend  # noqa: E402,F401
 from test_dkim2_split import send as send_split  # noqa: E402
 
 ALIAS = "chair@ietf.org"

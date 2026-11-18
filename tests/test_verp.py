@@ -12,8 +12,8 @@ import pytest
 
 import dkim2hop
 
-from test_dkim2_split import (BODY, BOUNCES, LIST, MAILMAN, SIGN, SUBSCRIBER,  # noqa: F401
-                              dkim2, fields, keys, resend, send, split, verified)
+from test_dkim2_split import (BODY, BOUNCES, LIST, MAILMAN, SIGN, SUBSCRIBER, fields, resend,  # noqa: F401
+                              send, verified)
 
 # mailman's default verp_regexp (src/mailman/config/schema.cfg)
 MAILMAN_VERP = re.compile(r"^(?P<bounces>[^+]+?)\+(?P<local>[^=]+)=(?P<domain>[^@]+)@.*$", re.I)

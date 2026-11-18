@@ -325,7 +325,7 @@ def fold(value, width=76):
             lines.extend(done)
     if line:
         lines.append(line)
-    return "\n\t".join(l.strip() for l in lines)
+    return "\n\t".join(part.strip() for part in lines)
 
 
 def _for_milter(field):
